@@ -4,6 +4,7 @@
     glowbug.py              run the daemon (LaunchAgent does this for you)
     glowbug.py install      set everything up (daemon, hooks, autostart)
     glowbug.py uninstall    remove everything cleanly
+    glowbug.py rescue       reflash firmware (works even on a "bricked" board)
     glowbug.py status       one-line health check
     glowbug.py --version
 
@@ -449,6 +450,15 @@ def install():
     print("==> Installing Glowbug to %s" % APP_DIR)
     os.makedirs(APP_DIR, exist_ok=True)
     shutil.copy(src, os.path.join(APP_DIR, "glowbug.py"))
+    fw_src = os.path.join(os.path.dirname(src), "firmware")
+    if os.path.exists(os.path.join(fw_src, "glowbug.bin")):
+        shutil.copy(os.path.join(fw_src, "glowbug.bin"),
+                    os.path.join(APP_DIR, "firmware.bin"))
+        for extra in ("VERSION", "SHA256SUMS"):
+            if os.path.exists(os.path.join(fw_src, extra)):
+                shutil.copy(os.path.join(fw_src, extra),
+                            os.path.join(APP_DIR, extra))
+        print("    rescue firmware image installed")
     with open(os.path.join(APP_DIR, "glowbug-hook.py"), "w") as f:
         f.write(HOOK_SOURCE)
     for name in ("glowbug.py", "glowbug-hook.py"):
@@ -509,6 +519,130 @@ def status():
         port or "not found"))
 
 
+
+# -------------------------------------------------------------------- rescue
+DFU_ID = "0483:df11"          # STM32 ROM bootloader, all families
+FW_RAW_URL = "https://raw.githubusercontent.com/pud-blip/glowbug/main/firmware/glowbug.bin"
+
+
+def _dfu_present():
+    try:
+        out = subprocess.run(["dfu-util", "-l"], capture_output=True,
+                             text=True, timeout=10).stdout
+        return DFU_ID in out
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _find_firmware():
+    """Locate the bundled known-good image; verify sha256 when a manifest
+    sits beside it. Returns (path, version) or (None, None)."""
+    import hashlib
+    here = os.path.dirname(os.path.abspath(__file__))
+    for base in (APP_DIR, os.path.join(here, "firmware")):
+        bin_path = os.path.join(base, "firmware.bin")
+        if not os.path.exists(bin_path):
+            bin_path = os.path.join(base, "glowbug.bin")
+        if not os.path.exists(bin_path):
+            continue
+        sums = os.path.join(base, "SHA256SUMS")
+        if os.path.exists(sums):
+            want = open(sums).read().split()[0]
+            got = hashlib.sha256(open(bin_path, "rb").read()).hexdigest()
+            if got != want:
+                print("!! %s fails its integrity check — ignoring it" % bin_path)
+                continue
+        ver = "unknown"
+        vp = os.path.join(base, "VERSION")
+        if os.path.exists(vp):
+            ver = open(vp).read().strip()
+        return bin_path, ver
+    return None, None
+
+
+def rescue():
+    """Reflash the known-good firmware. Handles a running board (sends the
+    in-band DFU command) AND a 'bricked' one (user holds the knob at plug-in
+    -> ROM bootloader). Never touches the network — if the image is missing,
+    prints the fetch command for the USER to run."""
+    if shutil.which("dfu-util") is None:
+        sys.exit("dfu-util is required for rescue. Install it with:\n\n"
+                 "    brew install dfu-util\n\nthen re-run: glowbug rescue")
+    fw, fw_ver = _find_firmware()
+    if fw is None:
+        sys.exit("No firmware image found. Fetch the known-good image with:\n\n"
+                 "    mkdir -p %s && curl -fsSL -o %s/firmware.bin \\\n"
+                 "        %s\n\nthen re-run: glowbug rescue"
+                 % (APP_DIR, APP_DIR, FW_RAW_URL))
+    print("==> Firmware image: %s (fw %s)" % (fw, fw_ver))
+
+    daemon_was_loaded = os.path.exists(PLIST_PATH)
+    if daemon_was_loaded:
+        subprocess.run(["launchctl", "unload", PLIST_PATH],
+                       capture_output=True)
+    try:
+        if not _dfu_present():
+            port = find_port()
+            if port:
+                print("==> Glowbug found on %s — asking it to enter update mode"
+                      % port)
+                try:
+                    fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+                    attrs = termios.tcgetattr(fd)
+                    attrs[0] = attrs[1] = attrs[3] = 0
+                    attrs[2] = termios.CREAD | termios.CLOCAL | termios.CS8
+                    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+                    os.write(fd, b"DFU\n")
+                    os.close(fd)
+                except OSError:
+                    pass
+                deadline = time.time() + 20
+            else:
+                print("""==> No Glowbug detected. Put it in Rescue Mode:
+
+    1. Unplug the Glowbug.
+    2. Press and hold the knob (push straight down) — keep holding.
+    3. While holding, plug the USB-C cable back in.
+    4. Keep holding two more seconds, then let go.
+
+The middle screen will read RESCUE MODE. Waiting up to 60s...""")
+                deadline = time.time() + 60
+            while not _dfu_present():
+                if time.time() > deadline:
+                    sys.exit("Never saw the device in rescue mode. Check the\n"
+                             "cable (charge-only cables are common!) and see\n"
+                             "TROUBLESHOOTING.md.")
+                time.sleep(1.5)
+        print("==> Rescue mode detected — writing firmware (~10s)...")
+        try:
+            r = subprocess.run(
+                ["dfu-util", "-a", "0", "-s", "0x08000000:leave", "-D", fw],
+                capture_output=True, text=True, timeout=90)
+            out = r.stdout + r.stderr
+        except subprocess.TimeoutExpired as e:
+            # dfu-util can hang on the final :leave handshake after the
+            # device has already reset into the app — judge by the output.
+            out = ((e.stdout or b"").decode(errors="replace") +
+                   (e.stderr or b"").decode(errors="replace"))
+        if "File downloaded successfully" not in out:
+            tail = "\n".join(out.strip().splitlines()[-6:])
+            sys.exit("Flash FAILED:\n%s" % tail)
+        print("==> Firmware written — waiting for the Glowbug to wake up...")
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if find_port():
+                print("\n✓ Glowbug restored (fw %s). Enjoy the welcome show."
+                      % fw_ver)
+                return
+            time.sleep(1.5)
+        print("\nFirmware written OK, but the device hasn't re-appeared —\n"
+              "unplug it and plug it back in.")
+    finally:
+        if daemon_was_loaded:
+            subprocess.run(["launchctl", "load", PLIST_PATH],
+                           capture_output=True)
+
+
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
     if arg == "install":
@@ -517,6 +651,8 @@ def main():
         uninstall()
     elif arg == "status":
         status()
+    elif arg == "rescue":
+        rescue()
     elif arg in ("--version", "version"):
         print("glowbug %s" % VERSION)
     elif arg == "":

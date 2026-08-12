@@ -6,8 +6,9 @@ room, which agent is thinking, which one needs you, and which one just finished.
 
 - **dark** — session idle
 - **deep blue ↔ violet fade** — thinking
-- **orange pulse + chime** — Claude has a question and is waiting on you
-- **green pulse + ding (5s)** — an agent just finished its turn
+- **orange pulse + chime** — Claude asked you a question
+- **pink pulse + chime** — Claude is waiting for permission to use a tool
+- **green pulse + ding** — an agent just finished its turn
 - **red blink** — error
 
 The underglow acts as one ambient lamp echoing the most important thing
@@ -56,6 +57,13 @@ cd glowbug && python3 glowbug.py install
 Then plug in your Glowbug. New Claude Code sessions appear on the device.
 (`glowbug status` for a health check; `glowbug.py uninstall` removes
 everything, including the hook entries, with a backup of your settings.)
+
+## If it ever seems dead
+
+`glowbug rescue` reflashes a known-good firmware image over USB — it works
+even if a bad update left the device unable to talk (hold the knob while
+plugging in → the screen shows RESCUE MODE). Full walkthrough in
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md). Needs `brew install dfu-util`.
 
 ## Privacy — what Glowbug can and cannot see
 

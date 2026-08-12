@@ -40,6 +40,21 @@ six metadata fields (event name, session id, title, cwd, tool name, error
 type) — never prompt text or file contents. The device receives only session
 names + status words.
 
+## Rescue / reflash
+
+`python3 glowbug.py rescue` (or `glowbug rescue`) reflashes the bundled
+known-good image in `firmware/` (glowbug.bin + VERSION + SHA256SUMS,
+sha256-verified). Works from a running board (sends the in-band DFU command)
+or a bricked one (user holds the knob while plugging in → ROM bootloader →
+"RESCUE MODE" on the middle screen). Requires dfu-util (`brew install
+dfu-util`). The command never touches the network — if the image is missing
+it prints a curl command for the user to run.
+
+**When firmware is updated:** rebuild in the (private) firmware tree, then
+refresh all three files here — `cp firmware.bin firmware/glowbug.bin`, update
+`firmware/VERSION`, regenerate `firmware/SHA256SUMS` (`shasum -a 256
+glowbug.bin > SHA256SUMS` from inside `firmware/`). They are the rescue image.
+
 ## Uninstall
 
 ```sh
