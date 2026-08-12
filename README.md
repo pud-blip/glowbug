@@ -5,8 +5,8 @@ sessions — five OLED screens and ten RGB LEDs that tell you, from across the
 room, which agent is thinking, which one needs you, and which one just finished.
 
 - **dark** — session idle
-- **deep blue ↔ violet fade** — thinking
-- **orange pulse + chime** — Claude asked you a question
+- **ember-orange breathe** — thinking (with a little star-spinner on its screen)
+- **deep blue ↔ violet fade + chime** — Claude asked you a question
 - **pink pulse + chime** — Claude is waiting for permission to use a tool
 - **green pulse + ding** — an agent just finished its turn
 - **red blink** — error
