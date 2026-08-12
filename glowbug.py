@@ -101,12 +101,15 @@ class Session:
         self.detail = ""
         self.last_seen = time.time()
         self.alive = True
+        self.died_at = 0.0           # set when alive flips False
 
     def display_state(self):
         """Merge hook state machine + registry into a protocol-v2 state.
         Registry-only sessions (hooks not installed) still get thinking/idle.
         (No unread state — user simplification 2026-08-12: a finished session
         just goes dark.)"""
+        if not self.alive:
+            return "closing"         # device: red 1s, fade 1s, then off
         if self.hook_state == "error":
             return "error"
         if self.hook_state == "waiting":
@@ -149,8 +152,11 @@ class Daemon:
     # the RIGHT; with more than 5, the row shifts LEFT (oldest falls off).
     def assign_slots(self):
         now = time.time()
+        # dead sessions hold their slot ~2.2s so the device can play the
+        # red "Closing..." farewell before the ticker compacts
         live = [s for s in self.sessions.values()
-                if s.alive and now - s.last_seen <= SESSION_STALE_S]
+                if (s.alive or now - s.died_at < 2.2)
+                and now - s.last_seen <= SESSION_STALE_S]
         live.sort(key=lambda s: (s.created, s.sid))
         self.slots = [s.sid for s in live[-NUM_SLOTS:]]
         while len(self.slots) < NUM_SLOTS:
@@ -172,9 +178,15 @@ class Daemon:
                 if info["created"]:
                     s.created = info["created"]
                 s.last_seen = time.time()
+            now2 = time.time()
             for sid, s in self.sessions.items():
                 if sid not in reg and s.alive:
                     s.alive = False
+                    s.died_at = now2
+                    changed = True
+                # keep pushing while any farewell window is open (so the
+                # slot actually drops when the 2.2s expires)
+                if not s.alive and now2 - s.died_at < 3.0:
                     changed = True
             if changed:
                 self.assign_slots()
@@ -209,6 +221,7 @@ class Daemon:
                 s.detail = ev.get("error_type", "")
             elif name == "SessionEnd":
                 s.alive = False
+                s.died_at = time.time()
             self.assign_slots()
             self.dirty = True
 
