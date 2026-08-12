@@ -28,7 +28,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
