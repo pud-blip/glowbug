@@ -35,7 +35,7 @@ curl -fsSL https://glowbug.dev/install | sh
 
 ```sh
 brew install pud-blip/tap/glowbug
-brew services start glowbug
+glowbug install
 ```
 
 **pipx / uv:**
