@@ -101,6 +101,7 @@ class Session:
         self.detail = ""
         self.last_seen = time.time()
         self.alive = True
+        self.born_at = time.time()   # arrival flutter window
         self.died_at = 0.0           # set when alive flips False
 
     def display_state(self):
@@ -114,6 +115,8 @@ class Session:
             return "error"
         if self.hook_state == "waiting":
             return "question"
+        if time.time() - self.born_at < 1.5:
+            return "arriving"        # device: firefly flutter-in + hello chirp
         if self.busy:
             return "thinking"
         return "idle"
@@ -184,9 +187,11 @@ class Daemon:
                     s.alive = False
                     s.died_at = now2
                     changed = True
-                # keep pushing while any farewell window is open (so the
-                # slot actually drops when the 2.2s expires)
+                # keep pushing while any farewell/arrival window is open
+                # (so transient states resolve without another event)
                 if not s.alive and now2 - s.died_at < 3.0:
+                    changed = True
+                if s.alive and now2 - s.born_at < 2.5:
                     changed = True
             if changed:
                 self.assign_slots()
