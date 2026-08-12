@@ -33,7 +33,7 @@ The middle screen will read:
 
 ```
    RESCUE MODE
-   ready for update
+   Ready for update
 ```
 
 No welcome animation, no lights — just that. It means the Glowbug is waiting
