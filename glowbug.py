@@ -93,6 +93,7 @@ def find_port():
 class Session:
     def __init__(self, sid):
         self.sid = sid
+        self.created = time.time()   # stable order key (registry startedAt wins)
         self.name = ""
         self.cwd = ""
         self.busy = False            # registry status
@@ -129,6 +130,7 @@ def read_registry():
                 "name": d.get("name") or os.path.basename(d.get("cwd", "")) or sid[:8],
                 "cwd": d.get("cwd", ""),
                 "busy": d.get("status") == "busy",
+                "created": d.get("startedAt", 0) / 1000.0,   # ms epoch -> s
             }
         except (OSError, ValueError, TypeError, KeyError):
             continue
@@ -142,22 +144,17 @@ class Daemon:
         self.lock = threading.Lock()
         self.dirty = True
 
-    # ---- slot policy: first 5 sessions keep their slots; freed on death ----
+    # ---- slot policy (user spec 2026-08-12): a chronological ticker.
+    # Sessions line up left->right by start time; a NEW session appears at
+    # the RIGHT; with more than 5, the row shifts LEFT (oldest falls off).
     def assign_slots(self):
         now = time.time()
-        for i, sid in enumerate(self.slots):
-            s = self.sessions.get(sid) if sid else None
-            if sid and (s is None or not s.alive or now - s.last_seen > SESSION_STALE_S):
-                self.slots[i] = None
-        placed = set(x for x in self.slots if x)
-        for s in sorted(self.sessions.values(), key=lambda s: s.last_seen):
-            if s.sid in placed or not s.alive:
-                continue
-            for i in range(NUM_SLOTS):
-                if self.slots[i] is None:
-                    self.slots[i] = s.sid
-                    placed.add(s.sid)
-                    break
+        live = [s for s in self.sessions.values()
+                if s.alive and now - s.last_seen <= SESSION_STALE_S]
+        live.sort(key=lambda s: (s.created, s.sid))
+        self.slots = [s.sid for s in live[-NUM_SLOTS:]]
+        while len(self.slots) < NUM_SLOTS:
+            self.slots.append(None)
 
     # ---- source 1: registry poll ----
     def poll_registry(self):
@@ -172,6 +169,8 @@ class Daemon:
                 if (s.name, s.cwd, s.busy, s.alive) != (info["name"], info["cwd"], info["busy"], True):
                     changed = True
                 s.name, s.cwd, s.busy, s.alive = info["name"], info["cwd"], info["busy"], True
+                if info["created"]:
+                    s.created = info["created"]
                 s.last_seen = time.time()
             for sid, s in self.sessions.items():
                 if sid not in reg and s.alive:
