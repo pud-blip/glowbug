@@ -121,9 +121,12 @@ class Session:
         # session file flips status busy -> waiting -> idle, so escaping
         # clears within one poll. The hook still gives instant onset (and the
         # tool name) before the registry catches up. Bench-proven 2026-08-12.
-        if self.reg_waiting:
-            return "question"
-        if self.hook_state == "waiting" and time.time() - self.waiting_at < 3.0:
+        # question (AskUserQuestion dialog) vs permission (a gated tool) —
+        # the PermissionRequest hook's tool_name is the discriminator.
+        if self.reg_waiting or (self.hook_state == "waiting"
+                                and time.time() - self.waiting_at < 3.0):
+            if self.detail and self.detail != "AskUserQuestion":
+                return "permission"
             return "question"
         if time.time() - self.born_at < 1.5:
             return "arriving"        # device: firefly flutter-in + hello chirp
@@ -194,6 +197,7 @@ class Daemon:
                 if s.hook_state == "waiting" and not info["waiting"] and \
                         time.time() - s.waiting_at >= 3.0:
                     s.hook_state = "idle"        # dialog gone: dismissed or answered
+                    s.detail = ""
                     changed = True
                 if info["created"]:
                     s.created = info["created"]
@@ -259,7 +263,7 @@ class Daemon:
                 s = self.sessions.get(sid) if sid else None
                 if s:
                     st = s.display_state()
-                    detail = s.detail if st in ("question", "error") else ""
+                    detail = s.detail if st in ("permission", "error") else ""
                     line = "SLOT %d STATE %s NAME %s DETAIL %s" % (
                         i + 1, st, s.name[:21], detail[:21])
                 else:
