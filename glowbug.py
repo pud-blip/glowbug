@@ -96,8 +96,10 @@ class Session:
         self.created = time.time()   # stable order key (registry startedAt wins)
         self.name = ""
         self.cwd = ""
-        self.busy = False            # registry status
-        self.hook_state = "idle"     # idle | working | waiting | unread | error
+        self.busy = False            # registry status == "busy"
+        self.reg_waiting = False     # registry status == "waiting" (dialog open)
+        self.hook_state = "idle"     # idle | working | waiting | error
+        self.waiting_at = 0.0        # when a hook last raised "waiting"
         self.detail = ""
         self.last_seen = time.time()
         self.alive = True
@@ -113,7 +115,15 @@ class Session:
             return "closing"         # device: red 1s, fade 1s, then off
         if self.hook_state == "error":
             return "error"
-        if self.hook_state == "waiting":
+        # "Claude is waiting on you" — the REGISTRY is authoritative here.
+        # No hook fires when the user dismisses a dialog or interrupts
+        # (docs: Stop "doesn't fire on user interrupts"), but Claude Code's
+        # session file flips status busy -> waiting -> idle, so escaping
+        # clears within one poll. The hook still gives instant onset (and the
+        # tool name) before the registry catches up. Bench-proven 2026-08-12.
+        if self.reg_waiting:
+            return "question"
+        if self.hook_state == "waiting" and time.time() - self.waiting_at < 3.0:
             return "question"
         if time.time() - self.born_at < 1.5:
             return "arriving"        # device: firefly flutter-in + hello chirp
@@ -136,6 +146,7 @@ def read_registry():
                 "name": d.get("name") or os.path.basename(d.get("cwd", "")) or sid[:8],
                 "cwd": d.get("cwd", ""),
                 "busy": d.get("status") == "busy",
+                "waiting": d.get("status") == "waiting",
                 "created": d.get("startedAt", 0) / 1000.0,   # ms epoch -> s
             }
         except (OSError, ValueError, TypeError, KeyError):
@@ -175,9 +186,15 @@ class Daemon:
                 if s is None:
                     s = self.sessions[sid] = Session(sid)
                     changed = True
-                if (s.name, s.cwd, s.busy, s.alive) != (info["name"], info["cwd"], info["busy"], True):
+                if (s.name, s.cwd, s.busy, s.reg_waiting, s.alive) != (
+                        info["name"], info["cwd"], info["busy"], info["waiting"], True):
                     changed = True
                 s.name, s.cwd, s.busy, s.alive = info["name"], info["cwd"], info["busy"], True
+                s.reg_waiting = info["waiting"]
+                if s.hook_state == "waiting" and not info["waiting"] and \
+                        time.time() - s.waiting_at >= 3.0:
+                    s.hook_state = "idle"        # dialog gone: dismissed or answered
+                    changed = True
                 if info["created"]:
                     s.created = info["created"]
                 s.last_seen = time.time()
@@ -193,6 +210,8 @@ class Daemon:
                     changed = True
                 if s.alive and now2 - s.born_at < 2.5:
                     changed = True
+                if s.hook_state == "waiting" and now2 - s.waiting_at < 4.0:
+                    changed = True        # keep pushing across the handoff
             if changed:
                 self.assign_slots()
                 self.dirty = True
@@ -201,6 +220,7 @@ class Daemon:
     def handle_hook(self, ev):
         name = ev.get("hook_event_name", "")
         sid = ev.get("session_id", "")
+        log("hook: %s sid=%s tool=%s" % (name, sid[:8], ev.get("tool_name", "-")))
         if not sid:
             return
         with self.lock:
@@ -214,6 +234,7 @@ class Daemon:
                 s.hook_state = "working"
             elif name == "PermissionRequest":
                 s.hook_state = "waiting"
+                s.waiting_at = time.time()
                 s.detail = ev.get("tool_name", "")
             elif name == "PostToolUse":
                 if s.hook_state == "waiting":
