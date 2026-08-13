@@ -24,7 +24,9 @@ Pick a door (they all do the same thing):
 
 **Tell Claude Code** (easiest — you already have it):
 
-> Install glowbug from github.com/pud-blip/glowbug
+```text
+Install glowbug from github.com/pud-blip/glowbug
+```
 
 **One-liner:**
 
@@ -39,11 +41,15 @@ brew install pud-blip/tap/glowbug
 glowbug install
 ```
 
-**pipx / uv:**
+**pipx:**
 
 ```sh
 pipx install glowbug && glowbug install
-# or
+```
+
+**uv:**
+
+```sh
 uvx glowbug install
 ```
 
