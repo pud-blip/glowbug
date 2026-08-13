@@ -1,13 +1,17 @@
 # Glowbug
 
-A little desk creature that shows your [Claude Code](https://claude.com/claude-code)
-sessions — five OLED screens and ten RGB LEDs that tell you, from across the
-room, which agent is thinking, which one needs you, and which one just finished.
+A little desk creature that shows your coding-agent sessions — five OLED
+screens and ten RGB LEDs that tell you, from across the room, which agent is
+thinking, which one needs you, and which one just finished.
+
+Works with [Claude Code](https://claude.com/claude-code), [Cursor](https://cursor.com),
+[Codex](https://developers.openai.com/codex), and [Antigravity](https://antigravity.google)
+— mix and match, one screen each.
 
 - **dark** — session idle
 - **ember-orange breathe** — thinking (with a little star-spinner on its screen)
-- **deep blue ↔ violet fade + chime** — Claude asked you a question
-- **pink pulse + chime** — Claude is waiting for permission to use a tool
+- **deep blue ↔ violet fade + chime** — the agent asked you a question
+- **pink pulse + chime** — the agent is waiting for permission to use a tool
 - **green pulse + ding** — an agent just finished its turn
 - **red blink** — error
 
@@ -60,9 +64,44 @@ git clone https://github.com/pud-blip/glowbug
 cd glowbug && python3 glowbug.py install
 ```
 
-Then plug in your Glowbug. New Claude Code sessions appear on the device.
-(`glowbug status` for a health check; `glowbug.py uninstall` removes
-everything, including the hook entries, with a backup of your settings.)
+Then plug in your Glowbug. New sessions appear on the device.
+(`glowbug status` for a health check, `glowbug doctor` when something's not
+showing up; `glowbug.py uninstall` removes everything, including the hook
+entries, with a backup of every config it touched.)
+
+Install finds whichever coding agents you already have and connects to each.
+**Install a new one later and it connects itself** — the daemon checks every
+few minutes. Hooks only ever attach to *new* sessions, so restart any that
+are already open.
+
+## Which agents, and what you'll see
+
+| | thinking | question | permission | done | error | closed |
+|---|---|---|---|---|---|---|
+| **Claude Code** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Cursor** | ✓ | — | — | ✓ | ✓ | ✓ |
+| **Codex** | ✓ | — | ✓ | ✓ | — | ✓ |
+| **Antigravity** | ✓ | — | — | ✓ | ✓ | after a while |
+
+The dashes are honest gaps, not bugs: those tools don't expose an
+*observational* event for that moment. Glowbug only ever subscribes to events
+it can watch without being able to interfere — it will never sit in the path
+of a shell command or a tool call, and never gets a vote on whether your agent
+is allowed to do something. Two consequences worth knowing:
+
+- Cursor has no watch-only signal for its approval dialog, so no pink light there.
+- Antigravity has no session-start or session-end event, so its screen appears
+  on the first tool call and clears a while after the session goes quiet.
+
+**Codex needs one setting** turned on for hooks to fire — add to `~/.codex/config.toml`:
+
+```toml
+[features]
+hooks = true
+```
+
+Glowbug prints this during install if it's missing. It doesn't edit that file
+— it's yours.
 
 ## If it ever seems dead
 
@@ -76,31 +115,40 @@ plugging in → the screen shows RESCUE MODE). Full walkthrough in
 The point of open-sourcing this is that you don't have to take our word:
 
 - **No network code.** Search the repo for `http`, `urllib`, `requests` —
-  there's nothing. Data flows from Claude Code's local files/hooks to a USB
+  there's nothing. Data flows from your agents' local files/hooks to a USB
   serial port. That's the entire graph.
-- **The hook forwards exactly six fields** and nothing else — search
-  [`glowbug.py`](glowbug.py) for `HOOK_SOURCE`, it's one screen of code:
+- **The hook forwards eight fields** and nothing else — search
+  [`glowbug.py`](glowbug.py) for `FORWARDER_SOURCE`, it's one screen of code:
   `hook_event_name`, `session_id`, `session_title`, `cwd`, `tool_name`,
-  `error_type`. **Never prompt text, never tool arguments, never file
+  `error_type`, plus `source` (which tool it came from) and `idle` (a
+  true/false). **Never prompt text, never tool arguments, never file
   contents.**
+- **Things the tools offer that we deliberately drop:** transcript paths,
+  model names, your email, turn ids, free-text error messages, file diffs,
+  shell commands. The whitelist is in the forwarder as an `ALIASES` table —
+  anything not named there never leaves that process.
 - The daemon also reads `~/.claude/sessions/*.json` (Claude Code's local
-  session registry) for session names and busy/idle status.
+  session registry) for session names and busy/idle status. The other tools
+  have no such registry, so for them the hooks are all Glowbug knows.
 - The device itself only ever receives a session's **name and a status word**.
 
 ## How it works
 
 ```
-Claude Code ──hooks──▶ glowbug-hook ──unix socket──▶ glowbug.py (daemon)
-Claude Code session registry (~/.claude/sessions) ──────▶      │
-                                                       USB serial (115200-ish,
-                                                        newline protocol)
+Claude Code ──┐
+Cursor ───────┤ hooks ──▶ glowbug-hook ──unix socket──▶ glowbug.py (daemon)
+Codex ────────┤                                             │
+Antigravity ──┘                                             │
+Claude Code session registry (~/.claude/sessions) ──────────▶│
+                                                       USB serial (newline
+                                                         text protocol)
                                                                 ▼
                                                             Glowbug 🐛✨
 ```
 
-The daemon assigns your first five sessions to the five slots (stable —
-sessions keep their screen), merges hook events with the session registry,
-and streams semantic states over a simple text protocol:
+The daemon gives each live session a screen (oldest on the left, newest on the
+right), merges hook events with Claude Code's session registry, and streams
+semantic states over a simple text protocol:
 
 ```
 SLOT 3 STATE question NAME my-project DETAIL Bash
@@ -112,7 +160,8 @@ on-device settings menu (brightness, underglow, sound, chime choice).
 ## Requirements
 
 - macOS (Apple Silicon or Intel), Python 3.9+ (the system one is fine)
-- Claude Code with hooks support
+- At least one of: Claude Code, Cursor 1.7+, Codex (with `features.hooks`),
+  Antigravity 2.0+
 - A Glowbug device (hardware docs coming later — glowbug.dev)
 
 ## Uninstall

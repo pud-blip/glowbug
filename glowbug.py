@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Glowbug — a little desk creature that shows your Claude Code sessions.
+"""Glowbug — a little desk creature that shows your coding-agent sessions.
 
     glowbug.py              run the daemon (LaunchAgent does this for you)
     glowbug.py install      set everything up (daemon, hooks, autostart)
     glowbug.py uninstall    remove everything cleanly
     glowbug.py rescue       reflash firmware (works even on a "bricked" board)
     glowbug.py status       one-line health check
+    glowbug.py doctor       verbose health check (paths, per-tool wiring)
     glowbug.py --version
 
 Everything Glowbug knows stays on this Mac. There is no network code in this
-file — it reads Claude Code's local session registry and hook events, and
-writes to the Glowbug device over USB serial. That's it. Read it and see:
-it's one file, standard library only.
+file — it reads your coding agents' local hook events (and Claude Code's
+session registry), and writes to the Glowbug device over USB serial. That's
+it. Read it and see: it's one file, standard library only.
 
 https://glowbug.dev · https://github.com/pud-blip/glowbug · MIT license
 """
@@ -28,11 +29,19 @@ import termios
 import threading
 import time
 
-VERSION = "1.0.1"
+VERSION = "1.4.0"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
 REGISTRY_POLL_S = 1.5
+
+# Hook-only sources (everything except Claude Code, which has a live session
+# registry to read) can't be polled — we only know what their hooks tell us.
+# A killed IDE never sends its "stop"/"session end" event, so these two
+# timeouts are what stop a dead session from owning a screen forever.
+WORK_STALE_S = 300                   # silent "working" session -> idle
+HOOK_SESSION_TTL_S = 2 * 3600        # silent session -> closed
+AUTOWIRE_POLL_S = 300                # look for newly-installed coding agents
 
 HOME = os.path.expanduser("~")
 APP_DIR = os.path.join(HOME, ".glowbug")
@@ -45,10 +54,167 @@ SESSIONS_DIR = os.path.join(HOME, ".claude", "sessions")
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PermissionRequest",
                "PostToolUse", "Stop", "StopFailure", "SessionEnd"]
 
-# The hook script Claude Code runs on session events — written to
-# ~/.glowbug/glowbug-hook.py by `install`. Embedded here so the whole
-# host software is genuinely ONE file (and pipx/uvx installs work).
-HOOK_SOURCE = '#!/usr/bin/env python3\n"""glowbug-hook — Claude Code hook forwarder (the entire trust surface).\n\nClaude Code runs this (async) on session events. It reads the hook\'s JSON\nfrom stdin, keeps ONLY the six fields Glowbug uses — never prompt text, never\ntool arguments, never file contents — and forwards them to the local Glowbug\ndaemon over a unix socket. No network. Fails silently in <250ms if the daemon\nisn\'t running, so it can never slow Claude Code down.\n"""\nimport json\nimport os\nimport socket\nimport sys\n\nSOCK_PATH = os.path.expanduser(\n    "~/Library/Application Support/Glowbug/daemon.sock")\n\nFIELDS = ("hook_event_name", "session_id", "session_title",\n          "cwd", "tool_name", "error_type")\n\n\ndef main():\n    raw = sys.stdin.buffer.read(65536)\n    if not raw:\n        return\n    try:\n        ev = json.loads(raw.decode(errors="replace"))\n        slim = {k: ev[k] for k in FIELDS if k in ev}\n        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n        s.settimeout(0.25)\n        s.connect(SOCK_PATH)\n        s.sendall(json.dumps(slim).encode())\n        s.close()\n    except (OSError, ValueError):\n        pass   # daemon not running / bad payload — never block Claude\n\n\nif __name__ == "__main__":\n    main()\n'
+# Where each tool keeps its config. We only ever write into a directory that
+# already exists — Glowbug never creates config for a tool you don't have.
+CURSOR_HOOKS = os.path.join(HOME, ".cursor", "hooks.json")
+CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+CODEX_HOOKS = os.path.join(CODEX_HOME, "hooks.json")
+CODEX_CONFIG = os.path.join(CODEX_HOME, "config.toml")
+# Antigravity's global config dir has moved around; we write into whichever
+# one already exists and never create one.
+ANTIGRAVITY_DIRS = [os.path.join(HOME, ".gemini", "config"),
+                    os.path.join(HOME, ".gemini", "antigravity-cli"),
+                    os.path.join(HOME, ".gemini", "antigravity")]
+
+# Which of each tool's events we subscribe to. ONLY observational ones: several
+# tools let a hook veto the action it is reporting, and Glowbug must never be
+# able to block your agent, so the "before/pre" families are deliberately
+# absent. The cost is that "thinking" starts at the first tool call rather
+# than at prompt submit.
+CURSOR_EVENTS = ["sessionStart", "afterAgentThought", "postToolUse",
+                 "afterShellExecution", "afterFileEdit", "afterAgentResponse",
+                 "stop", "sessionEnd"]
+# Codex runs these in the background (async), so they never sit in the way of
+# a tool call. PermissionRequest is what lights the "waiting on you" screen.
+CODEX_EVENTS = ["SessionStart", "UserPromptSubmit", "PostToolUse",
+                "PermissionRequest", "Stop", "SessionEnd"]
+# Antigravity: only its "after the fact" events. PreToolUse/PreInvocation are
+# decision points that can deny a tool call — we don't go near them.
+ANTIGRAVITY_EVENTS = ["PostToolUse", "PostInvocation", "Stop"]
+
+# Every source drives the same tiny state machine; only the event names differ.
+# An event that isn't listed here still counts as activity (keeps the session
+# "thinking"), so a tool adding new events can't break us.
+EVENT_MAPS = {
+    "cursor": {
+        "permission": (),                    # no observational approval event
+        "stop": ("stop",),
+        "end": ("sessionEnd",),
+    },
+    "codex": {
+        "permission": ("PermissionRequest",),
+        "stop": ("Stop", "agent-turn-complete"),   # hooks, and legacy notify
+        "end": ("SessionEnd",),
+    },
+    "antigravity": {
+        "permission": (),                    # no local approval event
+        "stop": ("Stop",),                   # carries fullyIdle -> our "idle"
+        "end": (),                           # no session-end event: TTL only
+    },
+}
+
+ERRORISH = ("error", "failed", "failure", "crash")
+
+# The hook script your coding agents run on session events — written to
+# ~/.glowbug/glowbug-hook.py by `install`. Embedded here so the whole host
+# software is genuinely ONE file (and pipx/uvx installs work). Read it: it is
+# the entire trust surface, and it is one screen of code.
+FORWARDER_SOURCE = '''#!/usr/bin/env python3
+# glowbug-hook -- the entire trust surface.
+#
+# Your coding agent runs this on session events. It reads the tool's JSON from
+# stdin, keeps ONLY the handful of fields Glowbug uses -- never prompt text,
+# never tool arguments, never file contents -- and forwards them to the local
+# Glowbug daemon over a unix socket. There is no network code here.
+#
+# It can never interfere with your agent: every failure path is swallowed, it
+# gives up on the socket after 250ms, and it always exits 0 (some tools treat
+# a non-zero exit as "block this action").
+#
+# Usage: glowbug-hook.py [--source NAME] [--event NAME] [--argv-json]
+#        no arguments  ==  --source claude   (keeps older installs working)
+import json
+import os
+import socket
+import sys
+
+SOCK_PATH = os.path.expanduser(
+    "~/Library/Application Support/Glowbug/daemon.sock")
+
+# canonical field  ->  the names the different tools use for it.
+# Anything not listed here NEVER leaves this process: prompt text, tool
+# arguments, file contents, transcript paths, model names, free-text errors.
+ALIASES = (
+    ("session_id",      ("session_id", "conversation_id", "conversationId",
+                         "sessionId", "thread-id", "threadId")),
+    ("session_title",   ("session_title", "title", "conversationTitle")),
+    ("cwd",             ("cwd", "workspace_roots", "workspacePaths", "workspace_root")),
+    ("tool_name",       ("tool_name", "toolName", "tool")),
+    ("error_type",      ("error_type", "status", "terminationReason", "termination_reason")),
+    ("hook_event_name", ("hook_event_name", "hookEventName", "eventName")),
+)
+
+
+def clean(v, limit):
+    """One short, single-line string, or nothing at all."""
+    if isinstance(v, (list, tuple)):
+        v = v[0] if v else ""
+    if not isinstance(v, str):
+        return ""
+    return " ".join(v.split())[:limit]
+
+
+def normalize(ev, source, event):
+    slim = {"source": source}
+    for canon, keys in ALIASES:
+        for k in keys:
+            if k in ev:
+                val = clean(ev[k], 64 if canon == "error_type" else 256)
+                if val:
+                    slim[canon] = val
+                break
+    if not slim.get("hook_event_name") and event:
+        slim["hook_event_name"] = event
+    if isinstance(ev.get("fullyIdle"), bool):
+        slim["idle"] = ev["fullyIdle"]     # Antigravity's turn-is-over flag
+    return slim
+
+
+ARGS = sys.argv[1:]
+
+
+def arg(flag, default=""):
+    for i, a in enumerate(ARGS):
+        if a == flag and i + 1 < len(ARGS):
+            return ARGS[i + 1]
+    return default
+
+
+SOURCE = arg("--source", "claude")
+
+
+def main():
+    args = ARGS
+    source, event = SOURCE, arg("--event")
+    argv_json = "--argv-json" in args
+    raw = b""
+    if not argv_json:                      # --argv-json: stdin may be a tty
+        raw = sys.stdin.buffer.read(65536)
+    if not raw and args and args[-1].lstrip().startswith("{"):
+        raw = args[-1].encode()            # some tools pass JSON as an argument
+    if not raw:
+        return
+    ev = json.loads(raw.decode(errors="replace"))
+    if not isinstance(ev, dict):
+        return
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(0.25)
+    s.connect(SOCK_PATH)
+    s.sendall(json.dumps(normalize(ev, source, event)).encode())
+    s.close()
+
+
+try:
+    main()
+except BaseException:
+    pass          # never, for any reason, interfere with the agent
+if SOURCE != "claude":
+    # An empty object means "no opinion" to the tools that read hook output.
+    # Written even if main() blew up, so a bug in here can't look like a
+    # malformed response. Claude Code gets silence, exactly as it always has.
+    sys.stdout.write("{}")
+sys.exit(0)
+'''
 
 # Old CoderDong install locations (pre-rename) — migrated away by `install`.
 OLD_DIR = os.path.join(HOME, ".coderdong")
@@ -92,8 +258,11 @@ def find_port():
 
 # ------------------------------------------------------------------- sessions
 class Session:
-    def __init__(self, sid):
+    def __init__(self, sid, source="claude"):
         self.sid = sid
+        self.source = source         # which coding agent this session belongs to
+        self.key = (source, sid)     # session ids are only unique per source
+        self.activity_at = time.time()   # last hook event of any kind
         self.created = time.time()   # stable order key (registry startedAt wins)
         self.name = ""
         self.cwd = ""
@@ -133,6 +302,13 @@ class Session:
             return "arriving"        # device: firefly flutter-in + hello chirp
         if self.busy:
             return "thinking"
+        # Sources without a session registry (everything but Claude Code) have
+        # only their hooks to go on: a turn is "working" from the first event
+        # until the tool says it stopped. reap_stale() is the safety net for a
+        # session that dies without ever sending that stop event.
+        if self.source != "claude" and self.hook_state == "working" \
+                and time.time() - self.activity_at < WORK_STALE_S:
+            return "thinking"
         return "idle"
 
 
@@ -160,10 +336,12 @@ def read_registry():
 
 class Daemon:
     def __init__(self):
-        self.sessions = {}                 # sid -> Session
+        self.sessions = {}                 # (source, sid) -> Session
         self.slots = [None] * NUM_SLOTS    # first-come, stable (user spec)
         self.lock = threading.Lock()
         self.dirty = True
+        self.last_event_at = {}            # source -> when we last heard from it
+        self.last_wire_check = 0.0         # auto-wire timer (see maybe_wire)
 
     # ---- slot policy (user spec 2026-08-12): a chronological ticker.
     # Sessions line up left->right by start time; a NEW session appears at
@@ -175,20 +353,43 @@ class Daemon:
         live = [s for s in self.sessions.values()
                 if (s.alive or now - s.died_at < 2.2)
                 and now - s.last_seen <= SESSION_STALE_S]
-        live.sort(key=lambda s: (s.created, s.sid))
-        self.slots = [s.sid for s in live[-NUM_SLOTS:]]
+        live.sort(key=lambda s: (s.created, s.source, s.sid))
+        self.slots = [s.key for s in live[-NUM_SLOTS:]]
         while len(self.slots) < NUM_SLOTS:
             self.slots.append(None)
 
-    # ---- source 1: registry poll ----
-    def poll_registry(self):
+    # ---- called on every poll tick: refresh Claude, retire the stale ----
+    def tick(self):
+        self.poll_claude_registry()
+        self.reap_stale()
+        self.maybe_wire()
+
+    def maybe_wire(self):
+        """Install a coding agent after Glowbug and it connects itself.
+        Only ever adds hooks to a tool that is actually installed, only once
+        per tool (delete our hook and it stays deleted), and can never be
+        fatal to the daemon."""
+        now = time.time()
+        if now - self.last_wire_check < AUTOWIRE_POLL_S:
+            return
+        self.last_wire_check = now
+        try:
+            for name, label, ok, added, note in wire_sources():
+                if ok and added:
+                    log("wired %s (%s) — new sessions will appear"
+                        % (label, ", ".join(added)))
+        except Exception as e:
+            log("auto-wire skipped: %s" % e)
+
+    # ---- Claude Code: live session registry ----
+    def poll_claude_registry(self):
         reg = read_registry()
         with self.lock:
             changed = False
             for sid, info in reg.items():
-                s = self.sessions.get(sid)
+                s = self.sessions.get(("claude", sid))
                 if s is None:
-                    s = self.sessions[sid] = Session(sid)
+                    s = self.sessions[("claude", sid)] = Session(sid, "claude")
                     changed = True
                 if (s.name, s.cwd, s.busy, s.reg_waiting, s.alive) != (
                         info["name"], info["cwd"], info["busy"], info["waiting"], True):
@@ -204,8 +405,12 @@ class Daemon:
                     s.created = info["created"]
                 s.last_seen = time.time()
             now2 = time.time()
-            for sid, s in self.sessions.items():
-                if sid not in reg and s.alive:
+            for key, s in self.sessions.items():
+                # "gone from the registry" only means dead for Claude Code —
+                # every other source is hook-driven and owns its own liveness
+                # (reap_stale below). Without this guard, sessions from other
+                # tools would be killed 1.5s after they appeared.
+                if s.source == "claude" and s.sid not in reg and s.alive:
                     s.alive = False
                     s.died_at = now2
                     changed = True
@@ -221,20 +426,93 @@ class Daemon:
                 self.assign_slots()
                 self.dirty = True
 
-    # ---- source 2: hook events (question/unread/error) ----
+    # ---- hook-only sources: retire what has gone quiet ----
+    def reap_stale(self):
+        """A killed IDE never sends its stop event. Without this a dead
+        session would hold a screen forever, thinking away."""
+        now = time.time()
+        changed = False
+        with self.lock:
+            for s in self.sessions.values():
+                if s.source == "claude" or not s.alive:
+                    continue           # Claude's liveness comes from the registry
+                if s.hook_state == "working" and now - s.activity_at > WORK_STALE_S:
+                    s.hook_state = "idle"
+                    s.detail = ""
+                    changed = True
+                if now - s.activity_at > HOOK_SESSION_TTL_S:
+                    s.alive = False
+                    s.died_at = now
+                    changed = True
+            if changed:
+                self.assign_slots()
+                self.dirty = True
+
+    # ---- hook events, from any source ----
     def handle_hook(self, ev):
+        source = ev.get("source") or "claude"
         name = ev.get("hook_event_name", "")
         sid = ev.get("session_id", "")
-        log("hook: %s sid=%s tool=%s" % (name, sid[:8], ev.get("tool_name", "-")))
+        log("hook[%s]: %s sid=%s tool=%s" % (
+            source, name, sid[:8], ev.get("tool_name", "-")))
+        self.last_event_at[source] = time.time()
         if not sid:
             return
+        if source == "claude":
+            self._hook_claude(ev, name, sid)
+        elif source in EVENT_MAPS:
+            self._hook_generic(ev, source, name, sid)
+
+    def _hook_generic(self, ev, source, name, sid):
+        """Hook-only sources: no registry to consult, so the events ARE the
+        state. Anything unrecognised counts as activity, never as an error."""
+        m = EVENT_MAPS[source]
+        now = time.time()
         with self.lock:
-            s = self.sessions.get(sid)
+            s = self.sessions.get((source, sid))
             if s is None:
-                s = self.sessions[sid] = Session(sid)
+                s = self.sessions[(source, sid)] = Session(sid, source)
+                s.name = (ev.get("session_title")
+                          or os.path.basename(ev.get("cwd", "")) or sid[:8])
+                s.cwd = ev.get("cwd", "")
+            elif not s.alive and name not in m["end"]:
+                s.alive = True          # it's back: flutter in again
+                s.born_at = now
+            if ev.get("session_title"):
+                s.name = ev["session_title"]
+            s.last_seen = s.activity_at = now
+
+            err = ev.get("error_type", "")
+            if name in m["end"]:
+                s.alive = False
+                s.died_at = now
+            elif name in m["permission"]:
+                s.hook_state = "waiting"
+                s.waiting_at = now
+                s.detail = ev.get("tool_name", "")
+            elif name in m["stop"]:
+                if ev.get("idle") is False:
+                    s.hook_state = "working"        # turn isn't over yet
+                elif any(w in err.lower() for w in ERRORISH):
+                    s.hook_state = "error"
+                    s.detail = err
+                else:
+                    s.hook_state = "idle"
+                    s.detail = ""
+            else:
+                s.hook_state = "working"            # any activity = a live turn
+                s.detail = ""
+            self.assign_slots()
+            self.dirty = True
+
+    def _hook_claude(self, ev, name, sid):
+        with self.lock:
+            s = self.sessions.get(("claude", sid))
+            if s is None:
+                s = self.sessions[("claude", sid)] = Session(sid, "claude")
                 s.name = ev.get("session_title") or os.path.basename(ev.get("cwd", "")) or sid[:8]
                 s.cwd = ev.get("cwd", "")
-            s.last_seen = time.time()
+            s.last_seen = s.activity_at = time.time()
             if name == "UserPromptSubmit":
                 s.hook_state = "working"
             elif name == "PermissionRequest":
@@ -258,10 +536,11 @@ class Daemon:
 
     # ---- board serial ----
     def push_state(self, fd):
+        debug = os.environ.get("GLOWBUG_DEBUG_SLOTS")
         with self.lock:
             for i in range(NUM_SLOTS):
-                sid = self.slots[i]
-                s = self.sessions.get(sid) if sid else None
+                key = self.slots[i]
+                s = self.sessions.get(key) if key else None
                 if s:
                     st = s.display_state()
                     detail = s.detail if st in ("permission", "error") else ""
@@ -269,8 +548,22 @@ class Daemon:
                         i + 1, st, s.name[:21], detail[:21])
                 else:
                     line = "SLOT %d STATE idle NAME - DETAIL " % (i + 1)
-                os.write(fd, (line + "\n").encode())
+                if debug:
+                    log("slot: %s" % line)   # bench testing without a device
+                if fd is not None:
+                    os.write(fd, (line + "\n").encode())
             self.dirty = False
+
+    def report(self):
+        """What `glowbug status` / `doctor` ask the daemon over the socket."""
+        now = time.time()
+        with self.lock:
+            sess = [{"source": s.source, "name": s.name,
+                     "state": s.display_state()}
+                    for k in self.slots if k for s in [self.sessions.get(k)] if s]
+        return {"version": VERSION, "sessions": sess,
+                "last_event_at": {k: round(now - v, 1)
+                                  for k, v in self.last_event_at.items()}}
 
     def handle_board_line(self, line):
         parts = line.strip().split()
@@ -290,7 +583,7 @@ class Daemon:
                     time.sleep(2)
                     # keep session state fresh even while unplugged
                     if time.time() - last_poll >= REGISTRY_POLL_S:
-                        self.poll_registry()
+                        self.tick()
                         last_poll = time.time()
                     continue
                 try:
@@ -307,7 +600,7 @@ class Daemon:
             try:
                 now = time.time()
                 if now - last_poll >= REGISTRY_POLL_S:
-                    self.poll_registry()
+                    self.tick()
                     last_poll = now
                 if now - last_ping >= PING_INTERVAL_S:
                     os.write(fd, b"PING\n")
@@ -356,7 +649,11 @@ class Daemon:
                         break
                     data += chunk
                 if data:
-                    self.handle_hook(json.loads(data.decode(errors="replace")))
+                    msg = json.loads(data.decode(errors="replace"))
+                    if isinstance(msg, dict) and "cmd" in msg:
+                        conn.sendall(json.dumps(self.report()).encode())
+                    else:
+                        self.handle_hook(msg)
             except (json.JSONDecodeError, socket.timeout, ValueError) as e:
                 log("bad hook payload: %s" % e)
             finally:
@@ -434,6 +731,257 @@ def launchctl(*args):
     return subprocess.run(["launchctl", *args], capture_output=True, text=True)
 
 
+# ------------------------------------------------- wiring up the other tools
+# Rules, in order of importance:
+#   1. only ever ADD entries; never rewrite or reorder what's already there
+#   2. back up before every write
+#   3. if a config file doesn't parse, leave it alone and say so — never guess
+#   4. never create a config directory for a tool that isn't installed
+#   5. wire each tool once; if you delete our hook, it stays deleted
+
+def hook_cmd(source, event=""):
+    """How a tool should invoke our forwarder. Explicit interpreter: apps
+    launched from the Finder have a minimal PATH, so a shebang is a coin flip."""
+    py = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
+    cmd = '%s -S -E "%s" --source %s' % (
+        py, os.path.join(APP_DIR, "glowbug-hook.py"), source)
+    return cmd + (" --event %s" % event if event else "")
+
+
+def read_json_config(path):
+    """{} if absent, the parsed config if readable, None if we must not touch it."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json_config(path, data):
+    if os.path.exists(path):
+        shutil.copy(path, path + ".glowbug-backup")
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_state():
+    try:
+        with open(os.path.join(APP_DIR, "state.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+        with open(os.path.join(APP_DIR, "state.json"), "w") as f:
+            json.dump(st, f, indent=2)
+    except OSError:
+        pass
+
+
+# ---- Claude Code ----
+def has_claude():
+    return True          # always wired: settings.json is created if absent,
+                         # so installing Claude Code later just works
+
+
+def install_claude():
+    added = merge_hooks(CLAUDE_SETTINGS, os.path.join(APP_DIR, "glowbug-hook.py"))
+    return True, added, ""
+
+
+def uninstall_claude():
+    return unmerge_hooks(CLAUDE_SETTINGS, "glowbug")
+
+
+# ---- Cursor ----
+def has_cursor():
+    return (os.path.isdir(os.path.join(HOME, ".cursor"))
+            or os.path.exists("/Applications/Cursor.app")
+            or bool(shutil.which("cursor-agent")))
+
+
+def install_cursor():
+    if not os.path.isdir(os.path.dirname(CURSOR_HOOKS)):
+        return False, [], "no ~/.cursor directory — is Cursor installed?"
+    cfg = read_json_config(CURSOR_HOOKS)
+    if cfg is None:
+        return False, [], "%s isn't valid JSON — left untouched" % CURSOR_HOOKS
+    cfg.setdefault("version", 1)
+    hooks = cfg.setdefault("hooks", {})
+    added = []
+    for ev in CURSOR_EVENTS:
+        entries = hooks.setdefault(ev, [])
+        if any("glowbug" in json.dumps(e) for e in entries):
+            continue
+        entries.append({"command": hook_cmd("cursor", ev), "timeout": 5})
+        added.append(ev)
+    if added:
+        write_json_config(CURSOR_HOOKS, cfg)
+    return True, added, ""
+
+
+def uninstall_cursor():
+    cfg = read_json_config(CURSOR_HOOKS)
+    if not cfg:
+        return 0
+    hooks = cfg.get("hooks", {})
+    removed = 0
+    for ev in list(hooks):
+        before = len(hooks[ev])
+        hooks[ev] = [e for e in hooks[ev] if "glowbug" not in json.dumps(e)]
+        removed += before - len(hooks[ev])
+        if not hooks[ev]:
+            del hooks[ev]
+    if removed:
+        write_json_config(CURSOR_HOOKS, cfg)
+    return removed
+
+
+# ---- Codex ----
+CODEX_TOML_NOTE = (
+    "Codex needs one setting turned on. Add these two lines to %s:\n"
+    "        [features]\n"
+    "        hooks = true\n"
+    "      (Glowbug doesn't edit that file — it's yours.)" % CODEX_CONFIG)
+
+
+def has_codex():
+    return os.path.isdir(CODEX_HOME) or bool(shutil.which("codex"))
+
+
+def codex_hooks_enabled():
+    """Read-only peek at config.toml — we never write to it."""
+    try:
+        with open(CODEX_CONFIG) as f:
+            txt = f.read()
+    except OSError:
+        return False
+    return bool(re.search(r"^\s*hooks\s*=\s*true", txt, re.M) or
+                re.search(r"^\s*features\s*\.\s*hooks\s*=\s*true", txt, re.M))
+
+
+def install_codex():
+    if not os.path.isdir(CODEX_HOME):
+        return False, [], "no %s directory — is Codex installed?" % CODEX_HOME
+    cfg = read_json_config(CODEX_HOOKS)
+    if cfg is None:
+        return False, [], "%s isn't valid JSON — left untouched" % CODEX_HOOKS
+    hooks = cfg.setdefault("hooks", {})
+    added = []
+    for ev in CODEX_EVENTS:
+        entries = hooks.setdefault(ev, [])
+        if any("glowbug" in json.dumps(e) for e in entries):
+            continue
+        entries.append({"hooks": [{"type": "command",
+                                   "command": hook_cmd("codex", ev),
+                                   "timeout": 5, "async": True}]})
+        added.append(ev)
+    if added:
+        write_json_config(CODEX_HOOKS, cfg)
+    return True, added, ("" if codex_hooks_enabled() else CODEX_TOML_NOTE)
+
+
+def uninstall_codex():
+    cfg = read_json_config(CODEX_HOOKS)
+    if not cfg:
+        return 0
+    hooks = cfg.get("hooks", {})
+    removed = 0
+    for ev in list(hooks):
+        before = len(hooks[ev])
+        hooks[ev] = [e for e in hooks[ev] if "glowbug" not in json.dumps(e)]
+        removed += before - len(hooks[ev])
+        if not hooks[ev]:
+            del hooks[ev]
+    if removed:
+        write_json_config(CODEX_HOOKS, cfg)
+    return removed
+
+
+# ---- Antigravity ----
+def antigravity_dir():
+    for d in ANTIGRAVITY_DIRS:
+        if os.path.isdir(d):
+            return d
+    return None
+
+
+def has_antigravity():
+    return (antigravity_dir() is not None
+            or os.path.exists("/Applications/Antigravity.app")
+            or bool(shutil.which("agy")))
+
+
+def install_antigravity():
+    d = antigravity_dir()
+    if d is None:
+        return False, [], ("no Antigravity config directory found (looked in %s)"
+                           % ", ".join(ANTIGRAVITY_DIRS))
+    path = os.path.join(d, "hooks.json")
+    cfg = read_json_config(path)
+    if cfg is None:
+        return False, [], "%s isn't valid JSON — left untouched" % path
+    entry = {"enabled": True}
+    for ev in ANTIGRAVITY_EVENTS:
+        entry[ev] = [{"matcher": "*",
+                      "hooks": [{"type": "command",
+                                 "command": hook_cmd("antigravity", ev),
+                                 "timeout": 5}]}]
+    if cfg.get("glowbug") == entry:
+        return True, [], ""
+    cfg["glowbug"] = entry             # one key of ours; everything else untouched
+    write_json_config(path, cfg)
+    return True, list(ANTIGRAVITY_EVENTS), ""
+
+
+def uninstall_antigravity():
+    removed = 0
+    for d in ANTIGRAVITY_DIRS:
+        path = os.path.join(d, "hooks.json")
+        cfg = read_json_config(path)
+        if cfg and "glowbug" in cfg:
+            del cfg["glowbug"]
+            write_json_config(path, cfg)
+            removed += 1
+    return removed
+
+
+SOURCES = [
+    ("claude",      "Claude Code", has_claude,      install_claude,      uninstall_claude),
+    ("cursor",      "Cursor",      has_cursor,      install_cursor,      uninstall_cursor),
+    ("codex",       "Codex",       has_codex,       install_codex,       uninstall_codex),
+    ("antigravity", "Antigravity", has_antigravity, install_antigravity, uninstall_antigravity),
+]
+
+
+def wire_sources(explicit=False):
+    """Register hooks with every detected tool. Returns a list of
+    (name, label, ok, added, note) for the caller to print or log."""
+    out = []
+    st = load_state()
+    wired = st.setdefault("wired", {})
+    for name, label, detect, do_install, _ in SOURCES:
+        try:
+            if not detect():
+                out.append((name, label, None, [], "not detected"))
+                continue
+            if not explicit and name in wired:
+                continue          # already done once; respect manual removal
+            ok, added, note = do_install()
+            if ok:
+                wired[name] = {"at": int(time.time()), "events": added or wired.get(name, {}).get("events", [])}
+            out.append((name, label, ok, added, note))
+        except Exception as e:            # a broken tool config is never fatal
+            out.append((name, label, False, [], str(e)))
+    save_state(st)
+    return out
+
+
 def install():
     src = os.path.abspath(__file__)
 
@@ -460,14 +1008,24 @@ def install():
                             os.path.join(APP_DIR, extra))
         print("    rescue firmware image installed")
     with open(os.path.join(APP_DIR, "glowbug-hook.py"), "w") as f:
-        f.write(HOOK_SOURCE)
+        f.write(FORWARDER_SOURCE)
     for name in ("glowbug.py", "glowbug-hook.py"):
         os.chmod(os.path.join(APP_DIR, name), 0o755)
 
-    print("==> Registering Claude Code hooks in %s" % CLAUDE_SETTINGS)
-    added = merge_hooks(CLAUDE_SETTINGS, os.path.join(APP_DIR, "glowbug-hook.py"))
-    print("    added: %s" % (", ".join(added) if added else "none (already installed)"))
-    print("    note: hooks apply to NEW Claude Code sessions only")
+    print("==> Connecting your coding agents")
+    results = wire_sources(explicit=True)
+    for name, label, ok, added, note in results:
+        if ok is None:
+            print("    %-14s not installed — skipped (it'll connect itself"
+                  " if you install it later)" % label)
+        elif ok:
+            print("    %-14s %s" % (label, "connected (%d events)" % len(added)
+                                    if added else "already connected"))
+            if note:
+                print("      ! %s" % note)
+        else:
+            print("    %-14s COULD NOT CONNECT: %s" % (label, note))
+    print("    note: hooks apply to NEW sessions only — restart any that are open")
 
     print("==> Installing LaunchAgent")
     os.makedirs(os.path.dirname(PLIST_PATH), exist_ok=True)
@@ -482,13 +1040,16 @@ def install():
     time.sleep(1.5)
     daemon_ok = launchctl("list", "dev.glowbug.daemon").returncode == 0
     port = find_port()
-    hooks_ok = bool(added) or os.path.getsize(CLAUDE_SETTINGS) > 0
     print()
     print("  %s daemon %s" % ("✓" if daemon_ok else "✗", "running" if daemon_ok else "NOT RUNNING"))
     print("  %s board %s" % ("✓" if port else "✗", ("connected (%s)" % port) if port else "not found — is it plugged in?"))
-    print("  %s hooks installed" % ("✓" if hooks_ok else "✗"))
+    for name, label, ok, added, note in results:
+        mark = "✓" if ok else ("—" if ok is None else "✗")
+        print("  %s %-14s %s" % (mark, label,
+                                 "connected" if ok else
+                                 ("not installed" if ok is None else note)))
     print()
-    print("Glowbug is %s. New Claude Code sessions will appear on the device."
+    print("Glowbug is %s. New sessions will appear on the device."
           % ("ready" if (daemon_ok and port) else "partially set up"))
 
 
@@ -498,9 +1059,14 @@ def uninstall():
     for p in (PLIST_PATH,):
         try: os.unlink(p)
         except OSError: pass
-    print("==> Removing Claude Code hooks")
-    n = unmerge_hooks(CLAUDE_SETTINGS, "glowbug")
-    print("    removed %d entries (backup: %s.glowbug-backup)" % (n, CLAUDE_SETTINGS))
+    print("==> Disconnecting from your coding agents")
+    for name, label, _detect, _install, do_uninstall in SOURCES:
+        try:
+            n = do_uninstall()
+            if n:
+                print("    %-14s removed %d hook entries (backup kept)" % (label, n))
+        except Exception as e:
+            print("    %-14s could not clean up: %s" % (label, e))
     print("==> Removing %s" % APP_DIR)
     shutil.rmtree(APP_DIR, ignore_errors=True)
     try:
@@ -510,6 +1076,26 @@ def uninstall():
     print("Glowbug uninstalled. (Log kept at %s)" % LOG_PATH)
 
 
+def ask_daemon(timeout=1.0):
+    """Ask the running daemon what it sees. None if it isn't listening."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(SOCK_PATH)
+        s.sendall(json.dumps({"cmd": "report"}).encode())
+        s.shutdown(socket.SHUT_WR)          # server reads to EOF
+        data = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+        return json.loads(data.decode(errors="replace"))
+    except (OSError, ValueError):
+        return None
+
+
 def status():
     daemon_ok = launchctl("list", "dev.glowbug.daemon").returncode == 0
     port = find_port()
@@ -517,6 +1103,44 @@ def status():
         VERSION,
         "running" if daemon_ok else "stopped",
         port or "not found"))
+
+
+def doctor():
+    """Everything you need to answer 'why isn't X showing up?'"""
+    daemon_ok = launchctl("list", "dev.glowbug.daemon").returncode == 0
+    port = find_port()
+    print("glowbug %s" % VERSION)
+    print("  daemon    %s" % ("running" if daemon_ok else "STOPPED"))
+    print("  board     %s" % (port or "not found — is it plugged in?"))
+    print("  app dir   %s" % APP_DIR)
+    print("  socket    %s" % SOCK_PATH)
+    print("  log       %s" % LOG_PATH)
+    print()
+    rep = ask_daemon()
+    if rep is None:
+        print("  The daemon isn't answering — start it with: glowbug install")
+        return
+    print("  Sessions on the device:")
+    if rep.get("sessions"):
+        for s in rep["sessions"]:
+            print("    %-12s %-21s %s" % (s["source"], s["name"], s["state"]))
+    else:
+        print("    (none — start a session, the device wakes within a second)")
+    print()
+    print("  Your coding agents:")
+    seen = rep.get("last_event_at") or {}
+    wired = (load_state().get("wired") or {})
+    for name, label, detect, _i, _u in SOURCES:
+        ago = seen.get(name)
+        if ago is not None:
+            note = "last event %.0fs ago" % ago
+        elif name in wired:
+            note = "connected — hooks only attach to NEW sessions, start one"
+        elif detect():
+            note = "installed but not connected yet — run: glowbug install"
+        else:
+            note = "not installed"
+        print("    %-14s %s" % (label, note))
 
 
 
@@ -651,6 +1275,8 @@ def main():
         uninstall()
     elif arg == "status":
         status()
+    elif arg == "doctor":
+        doctor()
     elif arg == "rescue":
         rescue()
     elif arg in ("--version", "version"):

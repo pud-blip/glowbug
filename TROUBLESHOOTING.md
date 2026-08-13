@@ -1,5 +1,47 @@
 # Glowbug — Troubleshooting
 
+## One of my coding agents isn't showing up
+
+Run `glowbug doctor` — it prints a line per agent, and that line tells you
+which of these you've hit:
+
+**"not installed"** — Glowbug can't find it. It looks for `~/.claude`,
+`~/.cursor`, `$CODEX_HOME` (default `~/.codex`), and Antigravity's config
+under `~/.gemini`. If the tool keeps its config somewhere else, that's the
+gap — open an issue with the path and we'll add it.
+
+**"installed but not connected yet"** — run `glowbug install`. (Normally the
+daemon does this for you within a few minutes of you installing a new tool.
+It won't, on purpose, if you previously deleted Glowbug's hook by hand.)
+
+**"connected — hooks only attach to NEW sessions"** — the wiring is in place
+but that tool hasn't sent an event yet. **Start a new session.** Hooks never
+apply retroactively to a session that was already open. Then watch the line
+change to "last event Ns ago".
+
+**Still nothing after a new session:**
+
+- **Codex** needs hooks switched on — add to `~/.codex/config.toml`:
+  ```toml
+  [features]
+  hooks = true
+  ```
+  Glowbug never edits that file, so this one is always yours to do.
+- **Cursor CLI** (`cursor-agent`) fires fewer events than the Cursor app, and
+  older versions may not read the global `~/.cursor/hooks.json` at all. The
+  app is the reliable one today.
+- **Antigravity** has no session-start event, so nothing appears until the
+  agent's *first tool call* — a pure-chat reply may never light a screen.
+- Check the agent's own hook config actually points at
+  `~/.glowbug/glowbug-hook.py`, and that the file is executable.
+- `tail -f ~/Library/Logs/glowbug.log` shows every event as it arrives.
+
+**A state I expected never lights up** — some are genuinely unavailable; see
+the support matrix in the README. Cursor has no watch-only approval event
+(no pink light), and Codex has no failure event (no red).
+
+---
+
 ## My Glowbug is dark and my Mac doesn't see it
 
 **First, the boring checks:**
