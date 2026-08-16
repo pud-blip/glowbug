@@ -32,6 +32,10 @@ change to "last event Ns ago".
   app is the reliable one today.
 - **Antigravity** has no session-start event, so nothing appears until the
   agent's *first tool call* — a pure-chat reply may never light a screen.
+- **Cursor showing a hex id** (`8aada7ae`) instead of the chat name — Cursor's
+  hooks don't include a title. Glowbug 1.4.11+ reads the name from Cursor's
+  local DB for sessions it already knows about. `glowbug install` from a
+  current tree, then wait ~1.5s (renames follow the same way).
 - Check the agent's own hook config actually points at
   `~/.glowbug/glowbug-hook.py`, and that the file is executable.
 - `tail -f ~/Library/Logs/glowbug.log` shows every event as it arrives.

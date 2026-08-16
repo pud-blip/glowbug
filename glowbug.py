@@ -10,9 +10,10 @@
     glowbug.py --version
 
 Everything Glowbug knows stays on this Mac. There is no network code in this
-file — it reads your coding agents' local hook events (and Claude Code's
-session registry), and writes to the Glowbug device over USB serial. That's
-it. Read it and see: it's one file, standard library only.
+file — it reads your coding agents' local hook events (Claude Code's
+session registry, and Cursor chat titles from its local DB), and writes to
+the Glowbug device over USB serial. That's it. Read it and see: it's one
+file, standard library only.
 
 https://glowbug.dev · https://github.com/pud-blip/glowbug · MIT license
 """
@@ -23,20 +24,22 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import termios
 import threading
 import time
 
-VERSION = "1.4.10"
+VERSION = "1.4.11"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
 REGISTRY_POLL_S = 1.5
 
-# Hook-only sources (everything except Claude Code, which has a live session
-# registry to read) can't be polled — we only know what their hooks tell us.
+# Codex and Antigravity have no session registry — we only know what their
+# hooks tell us. Cursor is the same for liveness, but its hooks omit the
+# chat title, so we poll names (only) from Cursor's local composerHeaders.
 # A killed IDE never sends its "stop"/"session end" event, so these two
 # timeouts are what stop a dead session from owning a screen forever.
 WORK_STALE_S = 300                   # silent "working" session -> idle
@@ -67,6 +70,10 @@ LOG_PATH = os.path.join(HOME, "Library", "Logs", "glowbug.log")
 PLIST_PATH = os.path.join(HOME, "Library", "LaunchAgents", "dev.glowbug.daemon.plist")
 CLAUDE_SETTINGS = os.path.join(HOME, ".claude", "settings.json")
 SESSIONS_DIR = os.path.join(HOME, ".claude", "sessions")
+# Cursor stores chat titles here; its hooks never send a session_title.
+CURSOR_STATE_DB = os.path.join(
+    HOME, "Library", "Application Support", "Cursor",
+    "User", "globalStorage", "state.vscdb")
 
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PermissionRequest",
                "PostToolUse", "Stop", "StopFailure", "SessionEnd"]
@@ -404,6 +411,41 @@ def read_registry():
     return out
 
 
+def read_cursor_titles(sids):
+    """Chat names from Cursor's composerHeaders table.
+
+    Cursor hooks have no title field (confirmed against the payload:
+    session_id / conversation_id only). We look up names for sessions we
+    already know about from hooks — never invent sessions from the DB,
+    never read subtitle / transcript / anything but `name`.
+    """
+    if not sids or not os.path.isfile(CURSOR_STATE_DB):
+        return {}
+    try:
+        uri = "file:%s?mode=ro" % CURSOR_STATE_DB
+        con = sqlite3.connect(uri, uri=True, timeout=0.2)
+        try:
+            q = "SELECT composerId, value FROM composerHeaders WHERE composerId IN (%s)" % (
+                ",".join("?" * len(sids)))
+            rows = con.execute(q, tuple(sids)).fetchall()
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError, ValueError):
+        return {}
+    out = {}
+    for cid, raw in rows:
+        try:
+            name = json.loads(raw).get("name") or ""
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if not isinstance(name, str):
+            continue
+        name = " ".join(name.split())[:256]
+        if name:
+            out[cid] = name
+    return out
+
+
 class Daemon:
     def __init__(self):
         self.sessions = {}                 # (source, sid) -> Session
@@ -439,6 +481,7 @@ class Daemon:
     # ---- called on every poll tick: refresh Claude, retire the stale ----
     def tick(self):
         self.poll_claude_registry()
+        self.poll_cursor_titles()
         self.reap_stale()
         self.maybe_wire()
         self.persist_sessions()
@@ -520,6 +563,21 @@ class Daemon:
                         % (label, ", ".join(added)))
         except Exception as e:
             log("auto-wire skipped: %s" % e)
+
+    # ---- Cursor: names only (hooks never include a title) ----
+    def poll_cursor_titles(self):
+        with self.lock:
+            sids = [s.sid for s in self.sessions.values()
+                    if s.source == "cursor" and s.alive]
+        titles = read_cursor_titles(sids)
+        if not titles:
+            return
+        with self.lock:
+            for sid, name in titles.items():
+                s = self.sessions.get(("cursor", sid))
+                if s is not None and s.name != name:
+                    s.name = name
+                    self.dirty = True
 
     # ---- Claude Code: live session registry ----
     def poll_claude_registry(self):

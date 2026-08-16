@@ -143,8 +143,12 @@ The point of open-sourcing this is that you don't have to take our word:
   shell commands. The whitelist is in the forwarder as an `ALIASES` table —
   anything not named there never leaves that process.
 - The daemon also reads `~/.claude/sessions/*.json` (Claude Code's local
-  session registry) for session names and busy/idle status. The other tools
-  have no such registry, so for them the hooks are all Glowbug knows.
+  session registry) for session names and busy/idle status. Cursor hooks
+  never include a chat title, so the daemon looks up **names only** from
+  Cursor's local `composerHeaders` table (`~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`)
+  for sessions it already learned about from hooks — it does not scan your
+  chat history. Codex and Antigravity have no such store, so for them the
+  hooks are all Glowbug knows.
 - The device itself only ever receives a session's **name and a status word**.
 
 ## How it works
@@ -155,6 +159,7 @@ Cursor ───────┤ hooks ──▶ glowbug-hook ──unix socket�
 Codex ────────┤                                             │
 Antigravity ──┘                                             │
 Claude Code session registry (~/.claude/sessions) ──────────▶│
+Cursor chat titles (local composerHeaders, names only) ─────▶│
                                                        USB serial (newline
                                                          text protocol)
                                                                 ▼
@@ -162,7 +167,8 @@ Claude Code session registry (~/.claude/sessions) ──────────
 ```
 
 The daemon gives each live session a screen (oldest on the left, newest on the
-right), merges hook events with Claude Code's session registry, and streams
+right), merges hook events with Claude Code's session registry (and Cursor
+chat titles from its local DB), and streams
 semantic states over a simple text protocol:
 
 ```
