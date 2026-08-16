@@ -31,7 +31,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.12"
+VERSION = "1.4.13"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
@@ -61,6 +61,16 @@ AUTOWIRE_POLL_S = 300                # look for newly-installed coding agents
 # that one still falls to the idle/TTL timers above.)
 APP_PROBE_S = 3.0                    # how often to scan the process table
 APP_GONE_S = 10.0                    # app unseen this long -> sessions dead
+
+# Appearance debounce for hook-only sources (user idea 2026-08-16): a
+# session gets a screen only once it has been alive HOOK_APPEAR_S; one
+# that dies younger than that was a micro-burst (tools fire sub-second
+# thought/response/stop flurries on auxiliary conversations) and is never
+# shown — no flash, no red farewell. Race-free because it's timestamp
+# arithmetic recomputed on every push, not a stateful flag: visible =
+# age >= HOOK_APPEAR_S; farewell = died AFTER having become visible.
+# Claude Code is exempt (registry-born, no burst class, appears instantly).
+HOOK_APPEAR_S = 2.0
 
 HOME = os.path.expanduser("~")
 APP_DIR = os.path.join(HOME, ".glowbug")
@@ -346,6 +356,11 @@ class Session:
         self.born_at = time.time()   # arrival flutter window
         self.died_at = 0.0           # set when alive flips False
 
+    def appear_at(self):
+        """When this session may first occupy a screen (HOOK_APPEAR_S)."""
+        return self.born_at + (0.0 if self.source == "claude"
+                               else HOOK_APPEAR_S)
+
     def display_state(self):
         """Merge hook state machine + registry into a protocol-v2 state.
         Registry-only sessions (hooks not installed) still get thinking/idle.
@@ -368,8 +383,10 @@ class Session:
             if self.detail and self.detail != "AskUserQuestion":
                 return "permission"
             return "question"
-        if time.time() - self.born_at < 1.5:
+        if 0 <= time.time() - self.appear_at() < 1.5:
             return "arriving"        # device: firefly flutter-in + hello chirp
+                                     # (anchored to when it APPEARS, so the
+                                     # debounce doesn't swallow the flutter)
         if self.busy:
             return "thinking"
         # Sources without a session registry (everything but Claude Code) have
@@ -479,7 +496,10 @@ class Daemon:
         # earlier soft-white-pulse treatment).
         live = [s for s in self.sessions.values()
                 if not s.is_subagent
-                and (s.alive or now - s.died_at < 2.2)
+                and ((s.alive and now >= s.appear_at())        # debounced in
+                     or (not s.alive and s.died_at >= s.appear_at()
+                         and now - s.died_at < 2.2))           # farewell only
+                                                               # if ever shown
                 and now - s.last_seen <= SESSION_STALE_S]
         live.sort(key=lambda s: (s.created, s.source, s.sid))
         self.slots = [s.key for s in live[-NUM_SLOTS:]]
@@ -644,8 +664,10 @@ class Daemon:
                     purge.append(key)
             for key in purge:
                 del self.sessions[key]
-                if s.alive and now2 - s.born_at < 2.5:
-                    changed = True
+                if s.alive and now2 - s.born_at < 5.0:
+                    changed = True    # covers the HOOK_APPEAR_S debounce
+                                      # crossing + the arrival flutter, so
+                                      # both happen without another event
                 if s.hook_state == "waiting" and now2 - s.waiting_at < 4.0:
                     changed = True        # keep pushing across the handoff
                 if s.done_at and now2 - s.done_at < DONE_S + 3.0:
@@ -795,6 +817,19 @@ class Daemon:
         with self.lock:
             s = self.sessions.get(("claude", sid))
             if s is None:
+                # Cross-reference against Claude's registry before believing
+                # a claude-tagged hook (bench 2026-08-16): Cursor's Claude-
+                # compat layer re-fires events through ~/.claude/settings.json
+                # hooks with no --source tag, so a CURSOR conversation id
+                # arrives labeled "claude", births a phantom session, and the
+                # next registry poll kills it — a 1.5s red flash on the
+                # device. Real Claude sessions always have a registry entry
+                # (the poll even births them itself), so dropping unknown
+                # sids costs nothing.
+                if sid not in self.last_reg:
+                    log("drop[claude]: sid=%s not in registry (compat echo?)"
+                        % sid[:8])
+                    return
                 s = self.sessions[("claude", sid)] = Session(sid, "claude")
                 s.name = ev.get("session_title") or os.path.basename(ev.get("cwd", "")) or sid[:8]
                 s.cwd = ev.get("cwd", "")
