@@ -96,7 +96,10 @@ it can watch without being able to interfere — it will never sit in the path
 of a shell command or a tool call, and never gets a vote on whether your agent
 is allowed to do something. Two consequences worth knowing:
 
-- Cursor has no watch-only signal for its approval dialog, so no pink light there.
+- Cursor has no watch-only signal for its approval dialog, so no pink light
+  there. And a freshly-opened chat pane doesn't get a screen until the agent
+  first does something — Cursor announces empty panes as sessions, and
+  Glowbug won't show a screen for a conversation that doesn't exist yet.
 - Antigravity has no session-start or session-end event, so its screen appears
   on the first tool call and clears a while after the session goes quiet.
 

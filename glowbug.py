@@ -29,7 +29,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.4"
+VERSION = "1.4.5"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
@@ -100,6 +100,12 @@ EVENT_MAPS = {
         "permission": (),                    # no observational approval event
         "stop": ("stop",),
         "end": ("sessionEnd",),
+        # A bare sessionStart may NOT create a session: Cursor fires one for
+        # a freshly-opened chat pane that has no conversation yet (bench
+        # 2026-08-16: sid "empty-state…", no further events, no sessionEnd —
+        # a permanent ghost screen). A real session births on its first
+        # actual agent event, seconds later.
+        "no_birth": ("sessionStart",),
     },
     "codex": {
         "permission": ("PermissionRequest",),
@@ -542,10 +548,20 @@ class Daemon:
         """Hook-only sources: no registry to consult, so the events ARE the
         state. Anything unrecognised counts as activity, never as an error."""
         m = EVENT_MAPS[source]
+        # Placeholder ids are not sessions (ghost rule, user directive
+        # 2026-08-16: never show agents that don't exist). Cursor's empty
+        # chat pane announces itself as sid "empty-state…"; treat any
+        # obviously-non-conversation id the same way, from any source.
+        low = sid.lower()
+        if low.startswith("empty") or low in ("unknown", "none", "null",
+                                              "undefined", "new"):
+            return
         now = time.time()
         with self.lock:
             s = self.sessions.get((source, sid))
             if s is None:
+                if name in m.get("no_birth", ()):
+                    return           # birth only on real agent activity
                 s = self.sessions[(source, sid)] = Session(sid, source)
                 s.name = (ev.get("session_title")
                           or os.path.basename(ev.get("cwd", "")) or sid[:8])
