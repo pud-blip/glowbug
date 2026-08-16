@@ -9,11 +9,18 @@ Works with [Claude Code](https://claude.com/claude-code), [Cursor](https://curso
 — mix and match, one screen each.
 
 - **dark** — session idle
-- **ember-orange breathe** — thinking (with a little star-spinner on its screen)
-- **deep blue ↔ violet fade + chime** — the agent asked you a question
+- **magenta-violet breathe** — thinking (with a little star-spinner on its screen)
+- **ember-orange fade + chime** — the agent asked you a question
 - **pink pulse + chime** — the agent is waiting for permission to use a tool
 - **green pulse + ding** — an agent just finished its turn
 - **red blink** — error
+- **soft white breathe** — an automated subagent (`claude -p` / background
+  verification runs), labeled "Subagent" on its screen so it never gets
+  mistaken for a session you left open
+
+Every pulse runs on its own clock — agents that start thinking at different
+moments breathe out of phase, so the board reads as separate creatures
+rather than one synchronized blob.
 
 The underglow acts as one ambient lamp echoing the most important thing
 happening on the board, so you don't even need to look directly at it.
@@ -151,7 +158,7 @@ right), merges hook events with Claude Code's session registry, and streams
 semantic states over a simple text protocol:
 
 ```
-SLOT 3 STATE question NAME my-project DETAIL Bash
+SLOT 3 STATE question NAME my-project DETAIL Bash SUB 0
 ```
 
 The device firmware owns all rendering — colors, animations, chimes, the

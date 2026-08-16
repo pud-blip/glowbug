@@ -29,7 +29,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
@@ -266,6 +266,10 @@ class Session:
         self.created = time.time()   # stable order key (registry startedAt wins)
         self.name = ""
         self.cwd = ""
+        self.is_subagent = False     # entrypoint == "sdk-cli" (Agent tool /
+                                      # `claude -p`), not a session the user
+                                      # opened themselves — labeled "(sub)"
+                                      # on the device (user report 2026-08-16)
         self.busy = False            # registry status == "busy"
         self.reg_waiting = False     # registry status == "waiting" (dialog open)
         self.hook_state = "idle"     # idle | working | waiting | error
@@ -325,6 +329,10 @@ def read_registry():
             out[sid] = {
                 "name": d.get("name") or os.path.basename(d.get("cwd", "")) or sid[:8],
                 "cwd": d.get("cwd", ""),
+                # entrypoint "sdk-cli" = launched via the Agent tool /
+                # `claude -p`, not a session the user opened by hand.
+                # "cli" (or absent) = a real interactive session.
+                "is_subagent": d.get("entrypoint") == "sdk-cli",
                 "busy": d.get("status") == "busy",
                 "waiting": d.get("status") == "waiting",
                 "created": d.get("startedAt", 0) / 1000.0,   # ms epoch -> s
@@ -391,11 +399,13 @@ class Daemon:
                 if s is None:
                     s = self.sessions[("claude", sid)] = Session(sid, "claude")
                     changed = True
-                if (s.name, s.cwd, s.busy, s.reg_waiting, s.alive) != (
-                        info["name"], info["cwd"], info["busy"], info["waiting"], True):
+                if (s.name, s.cwd, s.busy, s.reg_waiting, s.alive, s.is_subagent) != (
+                        info["name"], info["cwd"], info["busy"], info["waiting"], True,
+                        info["is_subagent"]):
                     changed = True
                 s.name, s.cwd, s.busy, s.alive = info["name"], info["cwd"], info["busy"], True
                 s.reg_waiting = info["waiting"]
+                s.is_subagent = info["is_subagent"]
                 if s.hook_state == "waiting" and not info["waiting"] and \
                         time.time() - s.waiting_at >= 3.0:
                     s.hook_state = "idle"        # dialog gone: dismissed or answered
@@ -544,10 +554,10 @@ class Daemon:
                 if s:
                     st = s.display_state()
                     detail = s.detail if st in ("permission", "error") else ""
-                    line = "SLOT %d STATE %s NAME %s DETAIL %s" % (
-                        i + 1, st, s.name[:21], detail[:21])
+                    line = "SLOT %d STATE %s NAME %s DETAIL %s SUB %d" % (
+                        i + 1, st, s.name[:21], detail[:21], 1 if s.is_subagent else 0)
                 else:
-                    line = "SLOT %d STATE idle NAME - DETAIL " % (i + 1)
+                    line = "SLOT %d STATE idle NAME - DETAIL  SUB 0" % (i + 1)
                 if debug:
                     log("slot: %s" % line)   # bench testing without a device
                 if fd is not None:
@@ -572,15 +582,47 @@ class Daemon:
             self.dirty = True
 
     def serial_loop(self):
+        # macOS sleep/wake gotcha (found 2026-08-16): closing the lid and
+        # waking often re-enumerates the CDC port under a NEW /dev path
+        # while the OLD fd is left silently dead — os.write()/os.read() on
+        # it don't raise, they just go nowhere, so the `except OSError`
+        # reconnect below never fires and the board sits in "Offline"
+        # until a manual unplug/replug. Fix: independent of write/read
+        # errors, re-run find_port() every PORT_RECHECK_S and force a
+        # reconnect whenever it disagrees with the fd we currently hold
+        # (device gone, or back under a different path) — this is the
+        # "poll to see if we're back online" the fd-error path can miss.
+        PORT_RECHECK_S = 2.0
         buf = b""
         fd = None
+        port = None
         last_ping = 0.0
         last_poll = 0.0
+        last_recheck = 0.0
+
+        def close_fd():
+            nonlocal fd, buf
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            fd = None
+            buf = b""
+
         while True:
+            now = time.time()
+            if now - last_recheck >= PORT_RECHECK_S:
+                last_recheck = now
+                current = find_port()
+                if fd is not None and current != port:
+                    log("serial: port changed (%s -> %s), reconnecting" % (port, current))
+                    close_fd()
+                port = current
+
             if fd is None:
-                port = find_port()
                 if port is None:
-                    time.sleep(2)
+                    time.sleep(0.2)
                     # keep session state fresh even while unplugged
                     if time.time() - last_poll >= REGISTRY_POLL_S:
                         self.tick()
@@ -595,10 +637,10 @@ class Daemon:
                     log("serial: opened %s" % port)
                     self.dirty = True
                 except OSError:
-                    time.sleep(2)
+                    fd = None
+                    time.sleep(0.2)
                     continue
             try:
-                now = time.time()
                 if now - last_poll >= REGISTRY_POLL_S:
                     self.tick()
                     last_poll = now
@@ -619,12 +661,7 @@ class Daemon:
                 time.sleep(0.05)
             except OSError:
                 log("serial: lost connection, rescanning")
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                fd = None
-                buf = b""
+                close_fd()
 
     # ---- hook socket ----
     def socket_loop(self):
