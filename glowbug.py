@@ -29,7 +29,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.8"
+VERSION = "1.4.9"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
@@ -668,6 +668,14 @@ class Daemon:
                 s.born_at = now
             if ev.get("session_title"):
                 s.name = ev["session_title"]
+            elif ev.get("cwd") and (not s.name or s.name == s.sid[:8]):
+                # Cursor never sends a chat title (its hook payloads have no
+                # title field at all — docs 2026-08-16), and workspace_roots
+                # only rides along on SOME events; upgrade a hex-id name to
+                # the project folder as soon as any event carries it.
+                s.name = os.path.basename(ev["cwd"]) or s.name
+            if ev.get("cwd") and not s.cwd:
+                s.cwd = ev["cwd"]
             s.last_seen = s.activity_at = now
 
             err = ev.get("error_type", "")
