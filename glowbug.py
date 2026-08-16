@@ -29,7 +29,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.9"
+VERSION = "1.4.10"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
@@ -415,6 +415,9 @@ class Daemon:
         self.last_probe = 0.0              # last process-table scan
         self.last_wire_check = 0.0         # auto-wire timer (see maybe_wire)
         self._persist_cache = None         # last sessions.json blob written
+        self.pending_meta = {}             # (source, sid) -> cwd/title stashed
+                                           # from a no_birth event (see
+                                           # _hook_generic), used at birth
         self.load_sessions()               # reattach to agents that were live
                                            # when the previous daemon exited
 
@@ -593,6 +596,10 @@ class Daemon:
         the idle/TTL timers (app open but the session went quiet)."""
         now = time.time()
         changed = False
+        # birth metadata that never got used (pane opened, never chatted)
+        for k in [k for k, v in self.pending_meta.items()
+                  if now - v["at"] > 600]:
+            del self.pending_meta[k]
         if now - self.last_probe >= APP_PROBE_S:
             self.last_probe = now
             seen = running_sources()
@@ -631,8 +638,10 @@ class Daemon:
         source = ev.get("source") or "claude"
         name = ev.get("hook_event_name", "")
         sid = ev.get("session_id", "")
-        log("hook[%s]: %s sid=%s tool=%s" % (
-            source, name, sid[:8], ev.get("tool_name", "-")))
+        extras = ",".join(k for k in ("cwd", "session_title") if ev.get(k))
+        log("hook[%s]: %s sid=%s tool=%s%s" % (
+            source, name, sid[:8], ev.get("tool_name", "-"),
+            " +" + extras if extras else ""))
         self.last_event_at[source] = time.time()
         if not sid:
             return
@@ -658,11 +667,23 @@ class Daemon:
             s = self.sessions.get((source, sid))
             if s is None:
                 if name in m.get("no_birth", ()):
+                    # No session yet — but don't discard the metadata:
+                    # Cursor puts workspace_roots on sessionStart while its
+                    # activity events (which birth the session) may lack it,
+                    # so this stash is the only way the slot gets a project
+                    # name instead of the raw hex conversation id
+                    # (bench 2026-08-16).
+                    if ev.get("cwd") or ev.get("session_title"):
+                        self.pending_meta[(source, sid)] = {
+                            "cwd": ev.get("cwd", ""),
+                            "title": ev.get("session_title", ""),
+                            "at": now}
                     return           # birth only on real agent activity
                 s = self.sessions[(source, sid)] = Session(sid, source)
-                s.name = (ev.get("session_title")
-                          or os.path.basename(ev.get("cwd", "")) or sid[:8])
-                s.cwd = ev.get("cwd", "")
+                meta = self.pending_meta.pop((source, sid), {})
+                s.cwd = ev.get("cwd") or meta.get("cwd", "")
+                s.name = (ev.get("session_title") or meta.get("title")
+                          or os.path.basename(s.cwd) or sid[:8])
             elif not s.alive and name not in m["end"]:
                 s.alive = True          # it's back: flutter in again
                 s.born_at = now
