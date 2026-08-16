@@ -29,7 +29,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.6"
+VERSION = "1.4.7"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
@@ -56,6 +56,7 @@ APP_GONE_S = 10.0                    # app unseen this long -> sessions dead
 HOME = os.path.expanduser("~")
 APP_DIR = os.path.join(HOME, ".glowbug")
 SOCK_PATH = os.path.join(HOME, "Library", "Application Support", "Glowbug", "daemon.sock")
+SESS_STATE = os.path.join(HOME, "Library", "Application Support", "Glowbug", "sessions.json")
 LOG_PATH = os.path.join(HOME, "Library", "Logs", "glowbug.log")
 PLIST_PATH = os.path.join(HOME, "Library", "LaunchAgents", "dev.glowbug.daemon.plist")
 CLAUDE_SETTINGS = os.path.join(HOME, ".claude", "settings.json")
@@ -402,6 +403,9 @@ class Daemon:
         self.app_seen_at = {}              # source -> ghost-buster last saw its app
         self.last_probe = 0.0              # last process-table scan
         self.last_wire_check = 0.0         # auto-wire timer (see maybe_wire)
+        self._persist_cache = None         # last sessions.json blob written
+        self.load_sessions()               # reattach to agents that were live
+                                           # when the previous daemon exited
 
     # ---- slot policy (user spec 2026-08-12): a chronological ticker.
     # Sessions line up left->right by start time; a NEW session appears at
@@ -423,6 +427,66 @@ class Daemon:
         self.poll_claude_registry()
         self.reap_stale()
         self.maybe_wire()
+        self.persist_sessions()
+
+    # ---- hook-only sessions survive daemon restarts ----
+    # Claude Code rebuilds from its live registry, but Cursor/Codex/
+    # Antigravity exist only in this process's memory — so a daemon restart
+    # (an UPDATE!) made a mid-turn agent invisible until its next hook event,
+    # possibly forever if its turn ended during the restart window (user
+    # report 2026-08-16). The session table is mirrored to disk and reloaded
+    # at startup; the ghost-buster and idle/TTL timers then re-verify
+    # everything restored, so a stale restore self-corrects in seconds.
+    def persist_sessions(self):
+        with self.lock:
+            data = [{"source": s.source, "sid": s.sid, "name": s.name,
+                     "cwd": s.cwd, "hook_state": s.hook_state,
+                     "waiting_at": s.waiting_at, "detail": s.detail,
+                     "created": s.created, "activity_at": s.activity_at}
+                    for s in self.sessions.values()
+                    if s.alive and s.source != "claude"]
+        blob = json.dumps(data, sort_keys=True)
+        if blob == self._persist_cache:
+            return
+        self._persist_cache = blob
+        try:
+            os.makedirs(os.path.dirname(SESS_STATE), exist_ok=True)
+            tmp = SESS_STATE + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(blob)
+            os.replace(tmp, SESS_STATE)
+        except OSError:
+            pass                        # persistence is best-effort
+
+    def load_sessions(self):
+        try:
+            saved = json.load(open(SESS_STATE))
+        except (OSError, ValueError):
+            return
+        now = time.time()
+        n = 0
+        for d in saved:
+            try:
+                if d["source"] == "claude" or \
+                        now - d["activity_at"] > HOOK_SESSION_TTL_S:
+                    continue
+                s = Session(d["sid"], d["source"])
+                s.name = d.get("name") or d["sid"][:8]
+                s.cwd = d.get("cwd", "")
+                s.hook_state = d.get("hook_state", "idle")
+                s.waiting_at = d.get("waiting_at", 0.0)
+                s.detail = d.get("detail", "")
+                s.created = d.get("created", now)
+                s.activity_at = s.last_seen = d["activity_at"]
+                s.born_at = 0.0         # no arrival-flutter replay on restore
+                self.sessions[s.key] = s
+                n += 1
+            except (KeyError, TypeError):
+                continue
+        if n:
+            log("restored %d hook session(s) from %s" % (n, SESS_STATE))
+            self.assign_slots()
+            self.dirty = True
 
     def maybe_wire(self):
         """Install a coding agent after Glowbug and it connects itself.
