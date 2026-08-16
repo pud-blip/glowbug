@@ -166,7 +166,7 @@ right), merges hook events with Claude Code's session registry, and streams
 semantic states over a simple text protocol:
 
 ```
-SLOT 3 STATE question NAME my-project DETAIL Bash SUB 0
+SLOT 3 STATE question NAME my-project DETAIL Bash SUB 0 SID 8aada7ae
 ```
 
 The device firmware owns all rendering — colors, animations, chimes, the

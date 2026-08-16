@@ -29,7 +29,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.5"
+VERSION = "1.4.6"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
@@ -635,10 +635,16 @@ class Daemon:
                 if s:
                     st = s.display_state()
                     detail = s.detail if st in ("permission", "error") else ""
-                    line = "SLOT %d STATE %s NAME %s DETAIL %s SUB %d" % (
-                        i + 1, st, s.name[:21], detail[:21], 1 if s.is_subagent else 0)
+                    # SID = which session occupies the slot, so firmware can
+                    # tell a ticker shift (different agent moved in) from a
+                    # state change of the same agent and skip transition
+                    # effects (Done! ding, chimes) on shifts.
+                    sid8 = (s.sid or "-").replace(" ", "")[:8] or "-"
+                    line = "SLOT %d STATE %s NAME %s DETAIL %s SUB %d SID %s" % (
+                        i + 1, st, s.name[:21], detail[:21],
+                        1 if s.is_subagent else 0, sid8)
                 else:
-                    line = "SLOT %d STATE idle NAME - DETAIL  SUB 0" % (i + 1)
+                    line = "SLOT %d STATE idle NAME - DETAIL  SUB 0 SID -" % (i + 1)
                 if debug:
                     log("slot: %s" % line)   # bench testing without a device
                 if fd is not None:
