@@ -29,7 +29,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
@@ -1055,7 +1055,11 @@ def install():
 
     print("==> Installing Glowbug to %s" % APP_DIR)
     os.makedirs(APP_DIR, exist_ok=True)
-    shutil.copy(src, os.path.join(APP_DIR, "glowbug.py"))
+    dst = os.path.join(APP_DIR, "glowbug.py")
+    # re-running install FROM the installed copy is a supported way to
+    # refresh hooks/forwarder — skip the self-copy instead of crashing
+    if os.path.abspath(src) != os.path.abspath(dst):
+        shutil.copy(src, dst)
     fw_src = os.path.join(os.path.dirname(src), "firmware")
     if os.path.exists(os.path.join(fw_src, "glowbug.bin")):
         shutil.copy(os.path.join(fw_src, "glowbug.bin"),
