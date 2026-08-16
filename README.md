@@ -101,6 +101,9 @@ is allowed to do something. Two consequences worth knowing:
   there. And a freshly-opened chat pane doesn't get a screen until the agent
   first does something — Cursor announces empty panes as sessions, and
   Glowbug won't show a screen for a conversation that doesn't exist yet.
+  To *close* a Cursor session on the device, **archive the chat** in Cursor
+  (Cursor has no close/end event, but the archive flag is visible) — the
+  screen plays its red farewell and frees up within a couple of seconds.
 - Antigravity has no session-start or session-end event, so its screen appears
   on the first tool call and clears a while after the session goes quiet.
 
@@ -145,7 +148,8 @@ The point of open-sourcing this is that you don't have to take our word:
   anything not named there never leaves that process.
 - The daemon also reads `~/.claude/sessions/*.json` (Claude Code's local
   session registry) for session names and busy/idle status. Cursor hooks
-  never include a chat title, so the daemon looks up **names only** from
+  never include a chat title, so the daemon looks up **names and the
+  archived flag only** from
   Cursor's local `composerHeaders` table (`~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`)
   for sessions it already learned about from hooks — it does not scan your
   chat history. Codex and Antigravity have no such store, so for them the
@@ -160,7 +164,7 @@ Cursor ───────┤ hooks ──▶ glowbug-hook ──unix socket�
 Codex ────────┤                                             │
 Antigravity ──┘                                             │
 Claude Code session registry (~/.claude/sessions) ──────────▶│
-Cursor chat titles (local composerHeaders, names only) ─────▶│
+Cursor chat titles + archived flag (local composerHeaders) ─▶│
                                                        USB serial (newline
                                                          text protocol)
                                                                 ▼

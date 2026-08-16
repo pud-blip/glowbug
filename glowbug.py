@@ -31,7 +31,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.13"
+VERSION = "1.4.14"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
@@ -429,12 +429,16 @@ def read_registry():
 
 
 def read_cursor_titles(sids):
-    """Chat names from Cursor's composerHeaders table.
+    """Chat names + archived flag from Cursor's composerHeaders table.
 
     Cursor hooks have no title field (confirmed against the payload:
-    session_id / conversation_id only). We look up names for sessions we
-    already know about from hooks — never invent sessions from the DB,
-    never read subtitle / transcript / anything but `name`.
+    session_id / conversation_id only) and no close/archive event either.
+    We look up sessions we already know about from hooks — never invent
+    sessions from the DB, never read subtitle / transcript / anything but
+    `name` and `isArchived`. Archiving a chat in Cursor is the user's
+    "close" gesture, so it retires the session on the device
+    (bench-verified 2026-08-16: isArchived flips true on archive).
+    Returns {sid: (name, archived)}.
     """
     if not sids or not os.path.isfile(CURSOR_STATE_DB):
         return {}
@@ -452,14 +456,16 @@ def read_cursor_titles(sids):
     out = {}
     for cid, raw in rows:
         try:
-            name = json.loads(raw).get("name") or ""
+            d = json.loads(raw)
+            name = d.get("name") or ""
+            archived = bool(d.get("isArchived"))
         except (ValueError, TypeError, AttributeError):
             continue
         if not isinstance(name, str):
             continue
         name = " ".join(name.split())[:256]
         if name:
-            out[cid] = name
+            out[cid] = (name, archived)
     return out
 
 
@@ -601,11 +607,24 @@ class Daemon:
         if not titles:
             return
         with self.lock:
-            for sid, name in titles.items():
+            changed = False
+            for sid, (name, archived) in titles.items():
                 s = self.sessions.get(("cursor", sid))
-                if s is not None and s.name != name:
+                if s is None:
+                    continue
+                if s.name != name:
                     s.name = name
-                    self.dirty = True
+                    changed = True
+                if archived and s.alive:
+                    # archiving IS Cursor's close gesture — red farewell,
+                    # slot freed (user request 2026-08-16)
+                    log("cursor: '%s' archived — closing" % s.name)
+                    s.alive = False
+                    s.died_at = time.time()
+                    changed = True
+            if changed:
+                self.assign_slots()
+                self.dirty = True
 
     # ---- Claude Code: live session registry ----
     def poll_claude_registry(self):
