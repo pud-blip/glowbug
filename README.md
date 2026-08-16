@@ -14,9 +14,10 @@ Works with [Claude Code](https://claude.com/claude-code), [Cursor](https://curso
 - **pink pulse + chime** — the agent is waiting for permission to use a tool
 - **green pulse + ding** — an agent just finished its turn
 - **red blink** — error
-- **soft white breathe** — an automated subagent (`claude -p` / background
-  verification runs), labeled "Subagent" on its screen so it never gets
-  mistaken for a session you left open
+
+Automated subagents (`claude -p` one-shots, background verification runs)
+are deliberately **not shown** — they aren't sessions you control, so a
+screen for them is just noise.
 
 Every pulse runs on its own clock — agents that start thinking at different
 moments breathe out of phase, so the board reads as separate creatures

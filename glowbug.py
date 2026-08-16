@@ -31,7 +31,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.11"
+VERSION = "1.4.12"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
@@ -456,6 +456,9 @@ class Daemon:
         self.app_seen_at = {}              # source -> ghost-buster last saw its app
         self.last_probe = 0.0              # last process-table scan
         self.last_wire_check = 0.0         # auto-wire timer (see maybe_wire)
+        self.last_reg = {}                 # last Claude registry snapshot —
+                                           # lets hook-births know a sid is a
+                                           # subagent BEFORE the next poll
         self._persist_cache = None         # last sessions.json blob written
         self.pending_meta = {}             # (source, sid) -> cwd/title stashed
                                            # from a no_birth event (see
@@ -469,9 +472,14 @@ class Daemon:
     def assign_slots(self):
         now = time.time()
         # dead sessions hold their slot ~2.2s so the device can play the
-        # red "Closing..." farewell before the ticker compacts
+        # red "Closing..." farewell before the ticker compacts.
+        # Subagents (Agent tool / `claude -p` verification runs) are tracked
+        # but never get a screen — the user has no control over them, so
+        # showing them is noise (user decision 2026-08-16, reversing the
+        # earlier soft-white-pulse treatment).
         live = [s for s in self.sessions.values()
-                if (s.alive or now - s.died_at < 2.2)
+                if not s.is_subagent
+                and (s.alive or now - s.died_at < 2.2)
                 and now - s.last_seen <= SESSION_STALE_S]
         live.sort(key=lambda s: (s.created, s.source, s.sid))
         self.slots = [s.key for s in live[-NUM_SLOTS:]]
@@ -583,6 +591,7 @@ class Daemon:
     def poll_claude_registry(self):
         reg = read_registry()
         with self.lock:
+            self.last_reg = reg
             changed = False
             for sid, info in reg.items():
                 s = self.sessions.get(("claude", sid))
@@ -789,6 +798,11 @@ class Daemon:
                 s = self.sessions[("claude", sid)] = Session(sid, "claude")
                 s.name = ev.get("session_title") or os.path.basename(ev.get("cwd", "")) or sid[:8]
                 s.cwd = ev.get("cwd", "")
+                # a `claude -p` subagent's hooks can arrive before the next
+                # registry poll — consult the last snapshot so it never
+                # flashes onto a screen for the poll-lag window
+                s.is_subagent = bool(
+                    self.last_reg.get(sid, {}).get("is_subagent"))
             s.last_seen = s.activity_at = time.time()
             if name == "UserPromptSubmit":
                 s.hook_state = "working"
