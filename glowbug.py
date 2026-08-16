@@ -29,7 +29,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.3"
+VERSION = "1.4.4"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
@@ -42,6 +42,16 @@ REGISTRY_POLL_S = 1.5
 WORK_STALE_S = 300                   # silent "working" session -> idle
 HOOK_SESSION_TTL_S = 2 * 3600        # silent session -> closed
 AUTOWIRE_POLL_S = 300                # look for newly-installed coding agents
+
+# Ghost-buster (user directive 2026-08-16: NEVER show agents that don't
+# exist). A hard-closed IDE never sends its sessionEnd hook, and before this
+# its sessions squatted a screen until the 2h TTL. So we ask the OS: if a
+# source's application has no running process AT ALL, every session it owns
+# is provably dead — reaped within seconds instead of hours. (An app that's
+# still open with a quietly-abandoned session inside is a different case;
+# that one still falls to the idle/TTL timers above.)
+APP_PROBE_S = 3.0                    # how often to scan the process table
+APP_GONE_S = 10.0                    # app unseen this long -> sessions dead
 
 HOME = os.path.expanduser("~")
 APP_DIR = os.path.join(HOME, ".glowbug")
@@ -104,6 +114,40 @@ EVENT_MAPS = {
 }
 
 ERRORISH = ("error", "failed", "failure", "crash")
+
+# What proves each hook-only source's app is actually running, for the
+# ghost-buster. Matched against `ps -axo args=` two ways: an .app-bundle
+# substring (the IDE) or the exact basename of the command (its CLI).
+# A source with NO entry here cannot be ghost-reaped (only the TTL saves
+# it) — always add a probe when adding a source.
+SOURCE_PROBES = {
+    "cursor":      {"substr": ("Cursor.app",),      "basenames": ("cursor", "cursor-agent")},
+    "codex":       {"substr": (),                    "basenames": ("codex",)},
+    "antigravity": {"substr": ("Antigravity.app",),  "basenames": ("antigravity",)},
+}
+
+
+def running_sources():
+    """The set of hook-only sources whose app/CLI is running right now.
+    Returns None when the probe itself failed — callers must treat that as
+    'no evidence either way' and reap nothing (fail open, never fabricate
+    a death)."""
+    try:
+        out = subprocess.run(["ps", "-axo", "args="],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    seen = set()
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        first = os.path.basename(line.split()[0])
+        for src, probe in SOURCE_PROBES.items():
+            if src not in seen and (first in probe["basenames"]
+                                    or any(sub in line for sub in probe["substr"])):
+                seen.add(src)
+    return seen
 
 # The hook script your coding agents run on session events — written to
 # ~/.glowbug/glowbug-hook.py by `install`. Embedded here so the whole host
@@ -349,6 +393,8 @@ class Daemon:
         self.lock = threading.Lock()
         self.dirty = True
         self.last_event_at = {}            # source -> when we last heard from it
+        self.app_seen_at = {}              # source -> ghost-buster last saw its app
+        self.last_probe = 0.0              # last process-table scan
         self.last_wire_check = 0.0         # auto-wire timer (see maybe_wire)
 
     # ---- slot policy (user spec 2026-08-12): a chronological ticker.
@@ -439,13 +485,32 @@ class Daemon:
     # ---- hook-only sources: retire what has gone quiet ----
     def reap_stale(self):
         """A killed IDE never sends its stop event. Without this a dead
-        session would hold a screen forever, thinking away."""
+        session would hold a screen forever, thinking away. Two layers:
+        the ghost-buster (app process gone -> sessions dead in ~10s) and
+        the idle/TTL timers (app open but the session went quiet)."""
         now = time.time()
         changed = False
+        if now - self.last_probe >= APP_PROBE_S:
+            self.last_probe = now
+            seen = running_sources()
+            if seen is not None:
+                for src in seen:
+                    self.app_seen_at[src] = now
         with self.lock:
             for s in self.sessions.values():
                 if s.source == "claude" or not s.alive:
                     continue           # Claude's liveness comes from the registry
+                if s.source in SOURCE_PROBES:
+                    # freshest proof-of-life: the probe saw the app, or a
+                    # hook arrived (a hook can only come from a live app)
+                    evidence = max(self.app_seen_at.get(s.source, 0.0),
+                                   self.last_event_at.get(s.source, 0.0))
+                    if evidence and now - evidence > APP_GONE_S:
+                        log("reap: %s app gone — closing '%s'" % (s.source, s.name))
+                        s.alive = False
+                        s.died_at = now
+                        changed = True
+                        continue
                 if s.hook_state == "working" and now - s.activity_at > WORK_STALE_S:
                     s.hook_state = "idle"
                     s.detail = ""

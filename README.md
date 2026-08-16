@@ -100,6 +100,11 @@ is allowed to do something. Two consequences worth knowing:
 - Antigravity has no session-start or session-end event, so its screen appears
   on the first tool call and clears a while after the session goes quiet.
 
+One thing that is never a gap: **ghost agents.** Quit (or force-quit) any of
+these apps and their screens clear within seconds — the daemon checks that a
+session's app is still running, so Glowbug never shows an agent that no
+longer exists.
+
 **Codex needs one setting** turned on for hooks to fire — add to `~/.codex/config.toml`:
 
 ```toml
