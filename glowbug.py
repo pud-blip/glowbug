@@ -31,7 +31,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.14"
+VERSION = "1.4.15"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
@@ -678,11 +678,6 @@ class Daemon:
                 # 2026-08-16: agents stayed put after a middle one closed).
                 if not s.alive and now2 - s.died_at < 6.0:
                     changed = True
-                # and eventually forget the dead entirely
-                if not s.alive and now2 - s.died_at > 30.0:
-                    purge.append(key)
-            for key in purge:
-                del self.sessions[key]
                 if s.alive and now2 - s.born_at < 5.0:
                     changed = True    # covers the HOOK_APPEAR_S debounce
                                       # crossing + the arrival flutter, so
@@ -692,6 +687,11 @@ class Daemon:
                 if s.done_at and now2 - s.done_at < DONE_S + 3.0:
                     changed = True        # keep pushing through the green
                                           # window AND its expiry back to idle
+                # and eventually forget the dead entirely
+                if not s.alive and now2 - s.died_at > 30.0:
+                    purge.append(key)
+            for key in purge:
+                del self.sessions[key]
             if changed:
                 self.assign_slots()
                 self.dirty = True
