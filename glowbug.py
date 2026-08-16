@@ -29,7 +29,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
@@ -582,23 +582,32 @@ class Daemon:
             self.dirty = True
 
     def serial_loop(self):
-        # macOS sleep/wake gotcha (found 2026-08-16): closing the lid and
-        # waking often re-enumerates the CDC port under a NEW /dev path
-        # while the OLD fd is left silently dead — os.write()/os.read() on
-        # it don't raise, they just go nowhere, so the `except OSError`
-        # reconnect below never fires and the board sits in "Offline"
-        # until a manual unplug/replug. Fix: independent of write/read
-        # errors, re-run find_port() every PORT_RECHECK_S and force a
-        # reconnect whenever it disagrees with the fd we currently hold
-        # (device gone, or back under a different path) — this is the
-        # "poll to see if we're back online" the fd-error path can miss.
+        # macOS sleep/wake gotcha (found 2026-08-16): after a lid-close the
+        # CDC port re-enumerates while the OLD fd is left silently dead —
+        # os.write()/os.read() on it don't raise, they just go nowhere, so
+        # the `except OSError` reconnect below never fires and the board
+        # sits in "Offline" until a manual replug. Worse (bench-observed
+        # same day): the port usually comes back under the SAME /dev path,
+        # so comparing paths alone doesn't catch it either. Three
+        # detections, all needed:
+        #   1. path change  — find_port() re-run every PORT_RECHECK_S,
+        #      reconnect when it disagrees with the fd we hold;
+        #   2. node identity — same path, but the device node was torn down
+        #      and recreated: its inode changes, so os.stat(port) vs
+        #      os.fstat(fd) disagree;
+        #   3. time jump    — this loop runs every 50ms; an iteration gap
+        #      >5s means the Mac slept. Reconnect unconditionally — after
+        #      any sleep the fd is suspect, and a spurious reopen is
+        #      harmless (one log line + a state re-push).
         PORT_RECHECK_S = 2.0
+        SLEEP_GAP_S = 5.0
         buf = b""
         fd = None
         port = None
         last_ping = 0.0
         last_poll = 0.0
         last_recheck = 0.0
+        last_loop = 0.0
 
         def close_fd():
             nonlocal fd, buf
@@ -612,12 +621,24 @@ class Daemon:
 
         while True:
             now = time.time()
+            if last_loop and now - last_loop > SLEEP_GAP_S:
+                log("serial: %.0fs time jump (slept?), reconnecting" % (now - last_loop))
+                close_fd()
+                last_recheck = 0.0          # re-scan the port immediately
+            last_loop = now
             if now - last_recheck >= PORT_RECHECK_S:
                 last_recheck = now
                 current = find_port()
                 if fd is not None and current != port:
                     log("serial: port changed (%s -> %s), reconnecting" % (port, current))
                     close_fd()
+                elif fd is not None and current is not None:
+                    try:                    # same path — but same NODE?
+                        if os.stat(current).st_ino != os.fstat(fd).st_ino:
+                            log("serial: device node recreated, reconnecting")
+                            close_fd()
+                    except OSError:
+                        close_fd()
                 port = current
 
             if fd is None:
