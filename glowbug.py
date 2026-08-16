@@ -29,7 +29,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.7"
+VERSION = "1.4.8"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
@@ -41,6 +41,12 @@ REGISTRY_POLL_S = 1.5
 # timeouts are what stop a dead session from owning a screen forever.
 WORK_STALE_S = 300                   # silent "working" session -> idle
 HOOK_SESSION_TTL_S = 2 * 3600        # silent session -> closed
+DONE_S = 30.0                        # green "just finished" celebration window.
+                                     # Host-owned (2026-08-16) so it SHIFTS with
+                                     # the agent when the ticker compacts —
+                                     # firmware used to synthesize it per-slot
+                                     # and the green got left behind / cleared.
+                                     # Matches firmware DONE_FLASH_MS (30s).
 AUTOWIRE_POLL_S = 300                # look for newly-installed coding agents
 
 # Ghost-buster (user directive 2026-08-16: NEVER show agents that don't
@@ -325,6 +331,8 @@ class Session:
         self.reg_waiting = False     # registry status == "waiting" (dialog open)
         self.hook_state = "idle"     # idle | working | waiting | error
         self.waiting_at = 0.0        # when a hook last raised "waiting"
+        self.done_at = 0.0           # when the agent last finished a turn —
+                                     # drives the green DONE_S celebration
         self.detail = ""
         self.last_seen = time.time()
         self.alive = True
@@ -364,6 +372,9 @@ class Session:
         if self.source != "claude" and self.hook_state == "working" \
                 and time.time() - self.activity_at < WORK_STALE_S:
             return "thinking"
+        if time.time() - self.done_at < DONE_S:
+            return "done"            # green celebration — travels with the
+                                     # session across ticker shifts
         return "idle"
 
 
@@ -442,7 +453,8 @@ class Daemon:
             data = [{"source": s.source, "sid": s.sid, "name": s.name,
                      "cwd": s.cwd, "hook_state": s.hook_state,
                      "waiting_at": s.waiting_at, "detail": s.detail,
-                     "created": s.created, "activity_at": s.activity_at}
+                     "created": s.created, "activity_at": s.activity_at,
+                     "done_at": s.done_at}
                     for s in self.sessions.values()
                     if s.alive and s.source != "claude"]
         blob = json.dumps(data, sort_keys=True)
@@ -475,6 +487,7 @@ class Daemon:
                 s.cwd = d.get("cwd", "")
                 s.hook_state = d.get("hook_state", "idle")
                 s.waiting_at = d.get("waiting_at", 0.0)
+                s.done_at = d.get("done_at", 0.0)
                 s.detail = d.get("detail", "")
                 s.created = d.get("created", now)
                 s.activity_at = s.last_seen = d["activity_at"]
@@ -519,6 +532,11 @@ class Daemon:
                         info["name"], info["cwd"], info["busy"], info["waiting"], True,
                         info["is_subagent"]):
                     changed = True
+                # "agent got back": busy (or waiting-on-you) -> plain idle
+                # starts the green celebration window
+                if (s.busy or s.reg_waiting) and \
+                        not info["busy"] and not info["waiting"]:
+                    s.done_at = time.time()
                 s.name, s.cwd, s.busy, s.alive = info["name"], info["cwd"], info["busy"], True
                 s.reg_waiting = info["waiting"]
                 s.is_subagent = info["is_subagent"]
@@ -531,6 +549,7 @@ class Daemon:
                     s.created = info["created"]
                 s.last_seen = time.time()
             now2 = time.time()
+            purge = []
             for key, s in self.sessions.items():
                 # "gone from the registry" only means dead for Claude Code —
                 # every other source is hook-driven and owns its own liveness
@@ -540,14 +559,28 @@ class Daemon:
                     s.alive = False
                     s.died_at = now2
                     changed = True
-                # keep pushing while any farewell/arrival window is open
-                # (so transient states resolve without another event)
-                if not s.alive and now2 - s.died_at < 3.0:
+                # keep pushing while any farewell/arrival window is open (so
+                # transient states resolve without another event). This window
+                # must comfortably outlast the 2.2s farewell slot-hold in
+                # assign_slots AND the 1.5s poll spacing — at the old 3.0s,
+                # a poll only landed in the (2.2, 3.0) gap about half the
+                # time, so the ticker often didn't compact until some
+                # unrelated state change forced a push (user report
+                # 2026-08-16: agents stayed put after a middle one closed).
+                if not s.alive and now2 - s.died_at < 6.0:
                     changed = True
+                # and eventually forget the dead entirely
+                if not s.alive and now2 - s.died_at > 30.0:
+                    purge.append(key)
+            for key in purge:
+                del self.sessions[key]
                 if s.alive and now2 - s.born_at < 2.5:
                     changed = True
                 if s.hook_state == "waiting" and now2 - s.waiting_at < 4.0:
                     changed = True        # keep pushing across the handoff
+                if s.done_at and now2 - s.done_at < DONE_S + 3.0:
+                    changed = True        # keep pushing through the green
+                                          # window AND its expiry back to idle
             if changed:
                 self.assign_slots()
                 self.dirty = True
@@ -652,6 +685,8 @@ class Daemon:
                     s.hook_state = "error"
                     s.detail = err
                 else:
+                    if s.hook_state in ("working", "waiting"):
+                        s.done_at = now         # turn over -> green celebration
                     s.hook_state = "idle"
                     s.detail = ""
             else:
