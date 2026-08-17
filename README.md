@@ -37,7 +37,7 @@ Pick a door (they all do the same thing):
 **Tell Claude Code** (easiest — you already have it):
 
 ```text
-Install glowbug from github.com/pud-blip/glowbug
+Install glowbug from github.com/pud/glowbug
 ```
 
 **One-liner:**
@@ -68,7 +68,7 @@ uvx glowbug install
 **By hand** (the fully-auditable path):
 
 ```sh
-git clone https://github.com/pud-blip/glowbug
+git clone https://github.com/pud/glowbug
 cd glowbug && python3 glowbug.py install
 ```
 

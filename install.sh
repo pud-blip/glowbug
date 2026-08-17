@@ -4,11 +4,11 @@
 # Nothing hidden: this downloads the repo tarball from GitHub, then runs
 # `glowbug.py install` (which prints everything it does and keeps a backup
 # of your Claude Code settings). Prefer to audit first? Do it by hand:
-#   git clone https://github.com/pud-blip/glowbug && cd glowbug
+#   git clone https://github.com/pud/glowbug && cd glowbug
 #   python3 glowbug.py install
 set -eu
 
-REPO="pud-blip/glowbug"
+REPO="pud/glowbug"
 TMP="$(mktemp -d /tmp/glowbug.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 

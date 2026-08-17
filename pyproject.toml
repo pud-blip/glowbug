@@ -21,7 +21,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://glowbug.dev"
-Source = "https://github.com/pud-blip/glowbug"
+Source = "https://github.com/pud/glowbug"
 
 [project.scripts]
 glowbug = "glowbug:main"

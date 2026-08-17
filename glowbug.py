@@ -15,7 +15,7 @@ session registry, and Cursor chat titles from its local DB), and writes to
 the Glowbug device over USB serial. That's it. Read it and see: it's one
 file, standard library only.
 
-https://glowbug.dev · https://github.com/pud-blip/glowbug · MIT license
+https://glowbug.dev · https://github.com/pud/glowbug · MIT license
 """
 
 import glob
@@ -1584,7 +1584,7 @@ def doctor():
 
 # -------------------------------------------------------------------- rescue
 DFU_ID = "0483:df11"          # STM32 ROM bootloader, all families
-FW_RAW_URL = "https://raw.githubusercontent.com/pud-blip/glowbug/main/firmware/glowbug.bin"
+FW_RAW_URL = "https://raw.githubusercontent.com/pud/glowbug/main/firmware/glowbug.bin"
 
 
 def _dfu_present():
