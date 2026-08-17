@@ -31,10 +31,12 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.15"
+VERSION = "1.4.16"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
+HID_POLL_S = 5.0                     # user-presence check cadence
+AWAY_S = 600.0                       # idle this long = "the user left"
 REGISTRY_POLL_S = 1.5
 
 # Codex and Antigravity have no session registry — we only know what their
@@ -293,6 +295,25 @@ sys.exit(0)
 # Old CoderDong install locations (pre-rename) — migrated away by `install`.
 OLD_DIR = os.path.join(HOME, ".coderdong")
 OLD_PLIST = os.path.join(HOME, "Library", "LaunchAgents", "com.pudtronics.coderdong.plist")
+
+
+def hid_idle_s():
+    """Seconds since the user last touched keyboard/mouse (system-wide via
+    IOHIDSystem — resets on input at the login screen too). None if the
+    ioreg read fails. Powers the WAKE signal: the board sleeps through a
+    display-off/login-screen stretch (the USB bus never suspends there, so
+    the firmware can't tell), and 'the human came back' is only visible
+    host-side (user report 2026-08-16: board stayed dark after login until
+    a hook event happened to fire)."""
+    try:
+        out = subprocess.run(["ioreg", "-c", "IOHIDSystem", "-d", "4"],
+                             capture_output=True, timeout=2).stdout.decode()
+        m = re.search(r'"HIDIdleTime" = (\d+)', out)
+        if m:
+            return int(m.group(1)) / 1e9
+    except Exception:
+        pass
+    return None
 
 
 def log(msg):
@@ -947,6 +968,8 @@ class Daemon:
         port = None
         last_ping = 0.0
         last_poll = 0.0
+        last_hid = 0.0
+        prev_idle = None             # last HID idle reading (user-presence edge)
         last_recheck = 0.0
         last_loop = 0.0
 
@@ -1009,6 +1032,18 @@ class Daemon:
                 if now - last_ping >= PING_INTERVAL_S:
                     os.write(fd, b"PING\n")
                     last_ping = now
+                if now - last_hid >= HID_POLL_S:
+                    last_hid = now
+                    idle = hid_idle_s()
+                    if idle is not None:
+                        # falling edge after a long absence = the user is back
+                        # (mouse jiggle / login keystroke): wake the board
+                        if prev_idle is not None and prev_idle > AWAY_S \
+                                and idle < HID_POLL_S + 1:
+                            os.write(fd, b"WAKE\n")
+                            log("user returned (idle %.0fs -> %.0fs): WAKE"
+                                % (prev_idle, idle))
+                        prev_idle = idle
                 if self.dirty:
                     self.push_state(fd)
                 try:
