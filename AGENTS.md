@@ -7,7 +7,7 @@ Claude Code sessions. This takes about a minute.
 
 1. Clone and install:
    ```sh
-   git clone https://github.com/pud-blip/glowbug /tmp/glowbug-install
+   git clone https://github.com/pud/glowbug /tmp/glowbug-install
    python3 /tmp/glowbug-install/glowbug.py install
    ```
 2. The installer prints a self-check: the daemon, the board, and one line per
