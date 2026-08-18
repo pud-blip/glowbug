@@ -1,6 +1,6 @@
 # Glowbug
 
-A little desk creature that shows your coding-agent sessions — five OLED
+A little desk device that shows your coding-agent sessions — five OLED
 screens and ten RGB LEDs that tell you, from across the room, which agent is
 thinking, which one needs you, and which one just finished.
 
@@ -20,8 +20,8 @@ are deliberately **not shown** — they aren't sessions you control, so a
 screen for them is just noise.
 
 Every pulse runs on its own clock — agents that start thinking at different
-moments breathe out of phase, so the board reads as separate creatures
-rather than one synchronized blob.
+moments breathe out of phase, so each agent reads as its own independent
+light rather than one synchronized blob.
 
 The underglow acts as one ambient lamp echoing the most important thing
 happening on the board, so you don't even need to look directly at it.
