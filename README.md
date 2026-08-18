@@ -1,6 +1,6 @@
 # Glowbug
 
-A desk device that shows your coding-agent sessions — five OLED
+A machined aluminum bar that shows your coding-agent sessions — five OLED
 screens and ten RGB LEDs that tell you, from across the room, which agent is
 thinking, which one needs you, and which one just finished.
 
