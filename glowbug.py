@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Glowbug — a little desk device that shows your coding-agent sessions.
+"""Glowbug — a desk device that shows your coding-agent sessions.
 
     glowbug.py              run the daemon (LaunchAgent does this for you)
     glowbug.py install      set everything up (daemon, hooks, autostart)
