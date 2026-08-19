@@ -31,7 +31,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.17"
+VERSION = "1.4.18"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
@@ -323,7 +323,10 @@ def log(msg):
             f.write(line)
     except OSError:
         pass
-    sys.stderr.write(line)
+    # under launchd, stderr IS the log file (StandardErrorPath) — writing
+    # both doubled every line; stderr is only for a foreground terminal
+    if sys.stderr.isatty():
+        sys.stderr.write(line)
 
 
 # ---------------------------------------------------------------- serial port
@@ -958,9 +961,17 @@ class Daemon:
         #      and recreated: its inode changes, so os.stat(port) vs
         #      os.fstat(fd) disagree;
         #   3. time jump    — this loop runs every 50ms; an iteration gap
-        #      >5s means the Mac slept. Reconnect unconditionally — after
-        #      any sleep the fd is suspect, and a spurious reopen is
-        #      harmless (one log line + a state re-push).
+        #      >5s means the Mac slept OR this process was starved of CPU
+        #      (bench 2026-08-18: a KeyShot render at load ~180 starved
+        #      this thread 5-13s at a time, over and over). A gap alone
+        #      does NOT invalidate the fd, so never reconnect on it
+        #      unconditionally — the old behavior turned every starvation
+        #      gap into a port drop, flapping the board between "Offline"
+        #      and the agents for the length of the render. Instead a gap
+        #      forces detections 1+2 to run THIS iteration (they are what
+        #      actually catch a slept-through re-enumeration) and forces
+        #      an immediate PING + full state re-push so a board that hit
+        #      its own no-PING timeout recovers right away.
         PORT_RECHECK_S = 2.0
         SLEEP_GAP_S = 5.0
         buf = b""
@@ -986,9 +997,21 @@ class Daemon:
         while True:
             now = time.time()
             if last_loop and now - last_loop > SLEEP_GAP_S:
-                log("serial: %.0fs time jump (slept?), reconnecting" % (now - last_loop))
-                close_fd()
-                last_recheck = 0.0          # re-scan the port immediately
+                gap = now - last_loop
+                if gap > 60.0:
+                    # a minute+ gap is a real sleep, not scheduler starvation
+                    # (worst starvation ever benched: 13s at load ~180).
+                    # Reconnect unconditionally — insurance for the one case
+                    # detections 1+2 can't see: a dead fd whose node was
+                    # never torn down. One reconnect per wake is harmless.
+                    log("serial: %.0fs gap (slept), reconnecting" % gap)
+                    close_fd()
+                else:
+                    log("serial: %.0fs gap (sleep or CPU starvation) — verifying port"
+                        % gap)
+                last_recheck = 0.0          # run detections 1+2 right now
+                last_ping = 0.0             # PING immediately, not next second
+                self.dirty = True           # re-push: un-"Offline" the board
             last_loop = now
             if now - last_recheck >= PORT_RECHECK_S:
                 last_recheck = now
@@ -1111,6 +1134,11 @@ PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
   <array><string>/usr/bin/python3</string><string>{app}/glowbug.py</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <!-- Interactive = launchd never background-throttles the daemon. Without
+       this, a saturated Mac (bench: load ~180 under a KeyShot render)
+       starves the serial thread for 5-13s at a stretch, the board misses
+       its PINGs, and the display flaps "Offline". -->
+  <key>ProcessType</key><string>Interactive</string>
   <key>StandardErrorPath</key><string>{log}</string>
 </dict>
 </plist>
