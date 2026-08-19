@@ -31,7 +31,7 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.18"
+VERSION = "1.4.19"
 NUM_SLOTS = 5
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
@@ -364,10 +364,11 @@ class Session:
         self.created = time.time()   # stable order key (registry startedAt wins)
         self.name = ""
         self.cwd = ""
-        self.is_subagent = False     # entrypoint == "sdk-cli" (Agent tool /
-                                      # `claude -p`), not a session the user
-                                      # opened themselves — labeled "(sub)"
-                                      # on the device (user report 2026-08-16)
+        self.is_subagent = False     # hidden from the device: a subagent
+                                      # (entrypoint "sdk-cli" — Agent tool /
+                                      # `claude -p`) or a background job /
+                                      # bg-spare (kind "bg"). Tracked, but
+                                      # never given a screen.
         self.busy = False            # registry status == "busy"
         self.reg_waiting = False     # registry status == "waiting" (dialog open)
         self.hook_state = "idle"     # idle | working | waiting | error
@@ -439,10 +440,17 @@ def read_registry():
             out[sid] = {
                 "name": d.get("name") or os.path.basename(d.get("cwd", "")) or sid[:8],
                 "cwd": d.get("cwd", ""),
-                # entrypoint "sdk-cli" = launched via the Agent tool /
-                # `claude -p`, not a session the user opened by hand.
-                # "cli" (or absent) = a real interactive session.
-                "is_subagent": d.get("entrypoint") == "sdk-cli",
+                # Hidden-from-device sessions (tracked, never shown):
+                #   entrypoint "sdk-cli" = launched via the Agent tool /
+                #   `claude -p`, not a session the user opened by hand;
+                #   kind "bg" = a background job or the pre-warmed
+                #   `claude bg-spare` — no terminal window exists for
+                #   these, so a screen would show a phantom agent
+                #   (user directive 2026-08-18: background jobs
+                #   shouldn't show). kind "interactive"/absent = a real
+                #   session the user can see.
+                "is_subagent": (d.get("entrypoint") == "sdk-cli"
+                                or d.get("kind") == "bg"),
                 "busy": d.get("status") == "busy",
                 "waiting": d.get("status") == "waiting",
                 "created": d.get("startedAt", 0) / 1000.0,   # ms epoch -> s
