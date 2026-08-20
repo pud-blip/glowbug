@@ -31,8 +31,14 @@ import termios
 import threading
 import time
 
-VERSION = "1.4.19"
-NUM_SLOTS = 5
+VERSION = "1.5.0"
+NUM_SLOTS = 5                        # pre-negotiation window (old boards show 5)
+BOARD_SLOTS_MAX = 32                 # protocol v3 cap: fw 1.4.0+ advertises
+                                     # "EVT HELLO <fw> PROTO 3 SLOTS 32"; the
+                                     # window widens only after that is seen
+                                     # (an old board silently DROPS SLOT n>5,
+                                     # so pushing 32 blind would show it the
+                                     # five OLDEST agents — never widen blind)
 SESSION_STALE_S = 12 * 3600          # silent sessions free their slot
 PING_INTERVAL_S = 1.0
 HID_POLL_S = 5.0                     # user-presence check cadence
@@ -504,6 +510,8 @@ def read_cursor_titles(sids):
 class Daemon:
     def __init__(self):
         self.sessions = {}                 # (source, sid) -> Session
+        self.board_slots = NUM_SLOTS       # effective window: 5 until the board
+                                           # answers HELLO with PROTO>=3 SLOTS n
         self.slots = [None] * NUM_SLOTS    # first-come, stable (user spec)
         self.lock = threading.Lock()
         self.dirty = True
@@ -540,8 +548,8 @@ class Daemon:
                                                                # if ever shown
                 and now - s.last_seen <= SESSION_STALE_S]
         live.sort(key=lambda s: (s.created, s.source, s.sid))
-        self.slots = [s.key for s in live[-NUM_SLOTS:]]
-        while len(self.slots) < NUM_SLOTS:
+        self.slots = [s.key for s in live[-self.board_slots:]]
+        while len(self.slots) < self.board_slots:
             self.slots.append(None)
 
     # ---- called on every poll tick: refresh Claude, retire the stale ----
@@ -912,10 +920,15 @@ class Daemon:
             self.dirty = True
 
     # ---- board serial ----
-    def push_state(self, fd):
+    def push_state(self):
+        """Build one full slot push as bytes. The serial loop queues it on
+        its TX buffer and drains non-blockingly — a board mid-blit (30-45ms
+        scroll frames on fw 1.4.0) backpressures the CDC pipe, and a
+        blocking write here would stall PING/registry polling."""
         debug = os.environ.get("GLOWBUG_DEBUG_SLOTS")
+        out = []
         with self.lock:
-            for i in range(NUM_SLOTS):
+            for i in range(len(self.slots)):
                 key = self.slots[i]
                 s = self.sessions.get(key) if key else None
                 if s:
@@ -933,9 +946,9 @@ class Daemon:
                     line = "SLOT %d STATE idle NAME - DETAIL  SUB 0 SID -" % (i + 1)
                 if debug:
                     log("slot: %s" % line)   # bench testing without a device
-                if fd is not None:
-                    os.write(fd, (line + "\n").encode())
+                out.append(line)
             self.dirty = False
+        return ("\n".join(out) + "\n").encode() if out else b""
 
     def report(self):
         """What `glowbug status` / `doctor` ask the daemon over the socket."""
@@ -952,6 +965,23 @@ class Daemon:
         parts = line.strip().split()
         if parts[:2] == ["EVT", "HELLO"]:
             log("board: hello %s" % " ".join(parts[2:]))
+            # Protocol v3 negotiation: "EVT HELLO <fw> PROTO 3 SLOTS 32".
+            # PROTO<3 (or unparseable) keeps the safe 5-slot window — an old
+            # board drops SLOT n>5 silently, which would otherwise leave it
+            # showing the five OLDEST agents.
+            slots = NUM_SLOTS
+            try:
+                if "PROTO" in parts and int(parts[parts.index("PROTO") + 1]) >= 3 \
+                        and "SLOTS" in parts:
+                    n = int(parts[parts.index("SLOTS") + 1])
+                    slots = max(NUM_SLOTS, min(BOARD_SLOTS_MAX, n))
+            except (ValueError, IndexError):
+                slots = NUM_SLOTS
+            with self.lock:
+                if slots != self.board_slots:
+                    log("board: slot window %d -> %d" % (self.board_slots, slots))
+                    self.board_slots = slots
+                self.assign_slots()
             self.dirty = True
 
     def serial_loop(self):
@@ -983,6 +1013,8 @@ class Daemon:
         PORT_RECHECK_S = 2.0
         SLEEP_GAP_S = 5.0
         buf = b""
+        txbuf = b""                  # unsent tail (non-blocking writes can
+                                     # short-write while the board is mid-blit)
         fd = None
         port = None
         last_ping = 0.0
@@ -993,7 +1025,7 @@ class Daemon:
         last_loop = 0.0
 
         def close_fd():
-            nonlocal fd, buf
+            nonlocal fd, buf, txbuf
             if fd is not None:
                 try:
                     os.close(fd)
@@ -1001,6 +1033,26 @@ class Daemon:
                     pass
             fd = None
             buf = b""
+            txbuf = b""
+            # a board we can no longer see must be re-negotiated on reconnect
+            with self.lock:
+                if self.board_slots != NUM_SLOTS:
+                    log("serial: window back to %d until next HELLO" % NUM_SLOTS)
+                    self.board_slots = NUM_SLOTS
+                    self.assign_slots()
+
+        def tx_drain():
+            # Drain as much of txbuf as the pipe accepts; never block. A
+            # persistent OSError propagates to the caller's reconnect path.
+            nonlocal txbuf
+            while txbuf:
+                try:
+                    n = os.write(fd, txbuf)
+                except BlockingIOError:
+                    return
+                if n <= 0:
+                    return
+                txbuf = txbuf[n:]
 
         while True:
             now = time.time()
@@ -1051,6 +1103,11 @@ class Daemon:
                     attrs[2] = termios.CREAD | termios.CLOCAL | termios.CS8
                     termios.tcsetattr(fd, termios.TCSANOW, attrs)
                     log("serial: opened %s" % port)
+                    # Solicit the board's capabilities: its own EVT HELLO
+                    # fires only at USB enumeration, which a (re)started
+                    # daemon has usually missed. New fw answers; old fw
+                    # ignores the line and the window stays at 5.
+                    txbuf += b"HELLO\n"
                     self.dirty = True
                 except OSError:
                     fd = None
@@ -1061,7 +1118,7 @@ class Daemon:
                     self.tick()
                     last_poll = now
                 if now - last_ping >= PING_INTERVAL_S:
-                    os.write(fd, b"PING\n")
+                    txbuf += b"PING\n"
                     last_ping = now
                 if now - last_hid >= HID_POLL_S:
                     last_hid = now
@@ -1071,12 +1128,19 @@ class Daemon:
                         # (mouse jiggle / login keystroke): wake the board
                         if prev_idle is not None and prev_idle > AWAY_S \
                                 and idle < HID_POLL_S + 1:
-                            os.write(fd, b"WAKE\n")
+                            txbuf += b"WAKE\n"
                             log("user returned (idle %.0fs -> %.0fs): WAKE"
                                 % (prev_idle, idle))
                         prev_idle = idle
                 if self.dirty:
-                    self.push_state(fd)
+                    txbuf += self.push_state()
+                if len(txbuf) > 65536:
+                    # pipe dead-but-undetected: drop the backlog whole (never
+                    # mid-line) and re-push once it drains again
+                    log("serial: TX backlog dropped (%dB unsent)" % len(txbuf))
+                    txbuf = b""
+                    self.dirty = True
+                tx_drain()
                 try:
                     chunk = os.read(fd, 256)
                     if chunk:
